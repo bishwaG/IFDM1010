@@ -994,6 +994,12 @@ suppressMessages(library(ggalluvial))
 suppressMessages(library(progeny))
 
 ## Load the saved object from previous session
+
+## From google drive
+# download.file("https://drive.google.com/uc?export=download&id=1wruq816oUFXUnMPn0SXIvSqDKejBegvh",  destfile = "aml.session2.RDS", mode = "wb")
+# aml <- readRDS("aml.session2.RDS")
+
+## From local Noppe folder
 aml <- readRDS("/home/rstudio/abptds/results/sc-rnaseq/robj/aml.session2.RDS")
 
 ```
