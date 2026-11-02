@@ -995,7 +995,7 @@ suppressMessages(library(progeny))
 
 ## Load the saved object from previous session
 
-## From google drive
+## Download and load from the google drive
 # download.file("https://drive.google.com/uc?export=download&id=1wruq816oUFXUnMPn0SXIvSqDKejBegvh",  destfile = "aml.session2.RDS", mode = "wb")
 # aml <- readRDS("aml.session2.RDS")
 
