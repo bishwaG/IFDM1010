@@ -1,0 +1,1065 @@
+---
+title: "RNASeq data analysis"
+author: "Bishwa Ghimire"
+date: "2025-09-22"
+output: 
+  html_document: 
+    toc: true
+    number_sections: true
+---
+```{bash}
+
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# git config --global --add safe.directory /home/rstudio/my-work
+# git config --global user.email "bishwa.ghimire@utu.fi"
+# git config --global user.name "Bishwa Ghimire"
+```
+# Introduction
+
+RNAseq reads undergo steps such as quality control, mapping to a reference genome and feature count which fall under primary data analysis which is outside the scope of this course. However, there exist web-based tools such as [RaNA-seq](https://ranaseq.eu) which simplifies the analysis complexity. We focus on the secondary analysis using the feature count (gene count) data produced from the primary analysis. This will aid us to find patterns and biologically relevant information from gene count data. In this course the secondary analyses are performed mainly in R, software environment for statistical computing. The package edgeR is used for normalization, filtering and differential gene expression analysis.
+
+# R libraries
+
+In this hands-on exercise on RNAseq data analysis, the following R packages are required.
+
+| Pagkage       | Description                          |
+|---------------|--------------------------------------|
+|edgeR          | For RNSseq data analysis             |
+|ggplot2        | For generating plots                 |
+|ggrepel        | Ggplot add-on for labels             |
+|reshape2       | Reshaping tables using `melt()`      |
+|biomaRt        | For annotating genes                 |
+|dplyr          | For data manipulation                |
+|ComplexHeatmap | For generating heatmaps              |
+|RColorBrewer   | For using color pallets in a heatmap |
+|topGO          | For gene set enrichment analysis     |
+
+```{r load-libraries, message=FALSE}
+suppressPackageStartupMessages(library(edgeR))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(ggrepel))
+suppressPackageStartupMessages(library(reshape2))
+suppressPackageStartupMessages(library(biomaRt))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(ComplexHeatmap))
+suppressPackageStartupMessages(library(RColorBrewer))
+suppressPackageStartupMessages(library(topGO))
+```
+> NOTE: The function `suppressPackageStartupMessages()` hides messages produced by the function `library()`. 
+
+# Loading the data
+
+We need the following files to perform RNASeq data analysis using edgeR.
+
+- count data (`data/rnaseq/merged-gene-counts.txt`)
+- gene annotation file with exon information (`data/rnaseq/gene-annotation.tsv`)
+- metadata (`data/rnaseq/metadata.tsv`)
+
+The data we are using here is from the study [Thapa et al. (2024)](https://doi.org/10.1038/s41366-024-01600-9). The data is publicly available in NCBI's Gene Expression Omnibus (accession number [GSE262618](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE262618)).
+
+```{r load data}
+## File paths
+dge.file        <- "/home/rstudio/abptds/data/rnaseq/merged-gene-counts.txt"
+meta.data.file  <- "/home/rstudio/abptds/data/rnaseq/metadata.tsv"
+gene.anno.file  <- "/home/rstudio/abptds/data/rnaseq/gene-annotation.tsv"
+ens.ref.release <- 102
+
+## Read gene annotation file
+anno <- read.table(gene.anno.file, sep="\t", header=T)
+
+## Read metadata file
+meta.data <- read.table(file=meta.data.file, 
+                         sep="\t", 
+                         header=TRUE, 
+                         stringsAsFactors = FALSE)
+## Read DGE
+dge            <- read.table(dge.file,
+                             header=T,
+                             row.names = 1,
+                             stringsAsFactors=F)
+```
+
+It is very important to have samples in the same order in both the count matrix and the metadata table.
+```{r validata-metadata-count}
+## Check order in metadata Sample column and DGE columns
+identical( meta.data$Sample, colnames(dge) )
+
+## check order of genes in anno and gene expresion matrix
+identical(rownames(anno), rownames(dge))
+dge <- dge[anno$GeneID, ]
+identical(anno$GeneID, rownames(dge))
+```
+
+To be able to use edgeR for gene expression analysis, the count data and metadata should be provided as `DGEList`. The `DGEList` object contains:
+
+- metadata (`count.data$samples`)
+- annotation (`count.data$genes`)
+- gene count (`count.data$counts`)
+
+Note that `group` parameter of the function `DGEList` contains group names which edgeR will use during differential gene expression.
+
+
+```{r create-DGEList}
+## Create a DGEList
+count.data      <- DGEList( counts=data.matrix(dge), 
+                            samples=meta.data, 
+                            #genes=anno,
+                            group=meta.data$Group)
+```
+
+> NOTE: `anno` is not needed if we do not have to use the function `rpkm()`
+
+# Data exploration
+
+It is essential to verify the number of samples and genes in our input data-frames.
+
+```{r dataframe-dims}
+dim(dge)
+dim(meta.data)
+dim(anno)
+
+head(dge)
+meta.data
+head(anno)
+```
+
+> **Question:** Why `nrow(dge)` equals to `nrow(anno)`?
+
+> **Question:** Why `nrow(meta.data)` equals to `ncol(dge)`?
+
+# Set output directories
+
+In the following code block creates output directories for storing files and plots in a logical structure.
+
+```{r create-directories}
+out.dir        <- file.path("results")
+res.dir        <- file.path(out.dir, "rnaseq")
+robj.dir       <- file.path(res.dir,"robj")
+plot.dir       <- file.path(res.dir,"plots")
+files.dir      <- file.path(res.dir,"files")
+plot.data.dir  <- file.path(res.dir,"plots-data")
+  
+  ## create dirs
+  dirs <- c(res.dir, robj.dir, plot.dir, files.dir, plot.data.dir)
+  
+  for(dir in dirs){
+    dir.create(dir, showWarnings = FALSE)
+  }
+  
+```
+
+It is a good idea to check whether or not above code block has created the expected directory structure. 
+```{r dir-tree, message=FALSE}
+  fs::dir_tree(path = res.dir)
+  
+```
+
+
+## Exploratory Data Analysis
+
+Exploratory data analyses help us to understand our data. In these analyses our goal is to visualize our data in different ways to get overall idea about the data. It is recommended to perform visualizations using log CPM (count per million) values. If we are comparing expression of a same gene from two different samples, we have to use CPM. On the other hand, if we are comparing expression of two different genes in a same sample, RPKM should be used.
+
+$$
+CPM = \frac{\text{Number of reads mapped to a gene} \times 10^6}{\text{Total number of mapped reads}}
+$$
+
+
+$$
+RPKM = \frac{\text{No. of reads mapped to a gene} \times 10^3 \times 10^6}{\text{Total number of mapped reads} \times \text{gene length in bp}}
+$$
+
+In the following code block we set output directories for the files and plots produced by exploratory data analysis. After creating the directories we are checking the directory tree using the function `dir_tree()` from the package fs.
+
+```{r expo-set-directories, message=FALSE}
+## results directories for exploratory analysis
+expo.plot.dir       <- file.path(res.dir,"plots",     "exploratory-analysis")
+expo.files.dir      <- file.path(res.dir,"files",     "exploratory-analysis")
+expo.plot.data.dir  <- file.path(res.dir,"plots-data","exploratory-analysis")
+
+## create directories
+dir.create(expo.plot.dir,      showWarnings = FALSE)
+dir.create(expo.files.dir,     showWarnings = FALSE)
+dir.create(expo.plot.data.dir, showWarnings = FALSE)
+
+## show directory structure
+fs::dir_tree(path = res.dir)
+```
+### Library sizes
+
+Library size refers to sequencing depth or total gene count per samples. It is calculated by edgeR automatically. The calculated library size in stored in the column `lib.size` of the data-frame `count.data$samples`.
+
+```{r library-size}
+## lib size plot
+barplot.data <- count.data$samples
+barplot.data$lib.size.million <- as.numeric( formatC( barplot.data$lib.size*1e-6 , digits = 2, format="f")  )
+barplot.data$sample <- rownames(barplot.data)
+  
+ls1 <- ggplot(barplot.data) +aes(x=sample, y=lib.size.million, fill=Group) + 
+    geom_bar(stat="identity") +
+    facet_wrap(~Group, scales = "free_x",) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    ylab("Library size (million)")
+  
+## show the plot
+ls1
+
+## save the plot
+ggsave(file.path(expo.plot.dir,paste0("library-size.png")), ls1, width=450,height=200,units="mm", dpi=300)
+
+## save the plot data
+write.table(barplot.data, file=file.path(expo.plot.data.dir,"library-size.tsv"), sep="\t", row.names=T, quote=F )
+```
+
+
+> **Question:** Can you calculate library sizes for each samples by yourself?
+
+
+### Normalization
+
+Difference in sample library size or sequencing depth adds bias to RNAseq data. Thus, some sort of normalization should be applied to our data to correct library size differences. Here, we normalize the count data using edgeR’s TMM (trimmed mean of M-values) normalization method. 
+
+```{r normalization-unfiltered}
+## Calculate normalization factors to scale the raw library sizes. 
+count.data              <- calcNormFactors(count.data, method="TMM")
+
+## count per million
+cpm.data                <- cpm (count.data, normalized.lib.sizes=TRUE, log=TRUE)
+
+```
+
+The function `calcNormFactors()` calculates scaling factors (column `norm.factors` of the data-frame `count.data$samples`) to convert observed library sizes into normalized library sizes.
+
+> Question: How do you calculated effective library sizes from observed library sizes and scaling factors?
+
+### PCA
+
+Principal component analysis is a common way to visualize high dimensional data in low dimension (2D/3D). Principal component analysis gives new feature space by capturing as much variation as possible. The new feature space is called principal component (PC). First few PCs capture most of the variation from the data. By visualizing those components we get an idea about patterns in our data. If there are additional column (other than Sample, Group and Control ) in meta data table, it is recommended to produces PCA plots colored by column name. This will helps us to find whether or not there is an effect of co-variates in our data.
+
+```{r pca-unfiltered}
+## Run PCA. NOTE: genes should be in column and the samples should be in the rows
+pca <- prcomp(t(cpm.data), scale=F, center=T)
+
+## Get % of variance explained by PC1 and PC2
+ylab <- paste("PC2 (Variance explained ", (summary(pca))$importance[2,2]*100, "%)")
+xlab <- paste("PC1 (Variance explained ", (summary(pca))$importance[2,1]*100, "%)")
+
+## Extract only PC1 and PC2.
+pca.plot.data <- as.data.frame( pca$x[,c("PC1", "PC2")] )
+pca.plot.data$Group <-  meta.data[rownames(pca.plot.data) %in% meta.data$Sample,"Group"] 
+pca.plot.data$label <-  rownames(pca.plot.data)
+
+## Plot
+pca1 <- ggplot(pca.plot.data, aes(x=PC1, y=PC2, label=label, color=Group)) + 
+  geom_point(alpha=0.4, stroke=1, size=4) +
+  geom_text_repel(color="#bbbbbb")+
+  labs(x = xlab, y = ylab) +
+  labs(color="label") 
+
+## display the plot
+pca1
+
+## save the plot
+ggsave(file.path(expo.plot.dir,"PCA-unfiltered.png"), pca1, width=350,height=300,units="mm", dpi=300)
+
+## save the plot data
+write.table(pca.plot.data, file=file.path(expo.plot.data.dir,"PCA-unfiltered.tsv"), sep="\t", row.names=T, quote=F )
+
+```
+
+### Density plot
+
+A density plot helps us to visualize the distribution of counts per sample. Note that the raw count is very skewed towards the left (low count).
+
+```{r density-plot-unfiltered}
+## expression density plot
+cpm.tidy <- reshape2::melt(cpm.data)
+colnames(cpm.tidy) <- c("Gene", "Sample", "logCPM")
+head(cpm.tidy)
+
+dp1 <- ggplot(cpm.tidy, aes(x = logCPM, color = Sample)) + 
+  geom_line(stat = "density", alpha = 0.6) +
+  labs(x = "logCPM") + 
+  theme(legend.position = "none")
+
+## show the plot
+dp1
+
+## save the plot
+ggsave(file.path(expo.plot.dir,"density-plot-unfiltered.png"), dp1, width=250,height=250,units="mm", dpi=300)
+
+## save the plot data
+write.table(pca.plot.data, file=file.path(expo.plot.data.dir,"density-plot-unfiltered.tsv"), sep="\t", row.names=T, quote=F )
+
+```
+### Similarity heatmap
+
+One way to visualize similarity between samples is a similarity heatmap. The similarity heatmap generated in the following code block shows similarity among samples. Closer the distance (euclidean) between two samples to zero, more similar they are to each other.
+
+The Euclidean distance between two points (in 3D) is given by:
+
+$$
+d = \sqrt{(x_2 - x_1)^2 + (y_2 - y_1)^2 + (z_2 - z_1)^2}
+$$
+
+```{r similarity heatmap, message=FALSE}
+## calculate euclidean distance
+eu.dist <- dist(t(cpm.data))
+
+## set seed for reproducible colors
+set.seed(1233)
+
+## Annotation
+ha <- HeatmapAnnotation(df=data.frame(Group=meta.data$Group, 
+                                     Control=as.character(meta.data$Control),
+                                     Sex=meta.data$Sex)
+                        ) 
+plot(ha)
+ 
+## Heatmap
+h1 <-  Heatmap(
+  as.matrix(eu.dist),
+  name = "Distance",
+  col = brewer.pal(4, "RdYlBu"),
+  na_col = "black",
+  show_row_dend = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  top_annotation = ha,
+  row_dend_reorder = T,
+  cluster_rows = T,
+  cluster_columns = T,
+  row_names_side = "left",
+  column_names_gp = gpar(fontsize = 10)
+)
+
+h1
+
+## save the plot
+png(filename = file.path(expo.plot.dir,"similarity-heatmap-unfiltered.png"), width=230, height=200, res=300,units="mm")
+draw(h1)
+dev.off()
+
+
+## save the plot data
+write.table(eu.dist, file=file.path(expo.plot.data.dir,"similarity-heatmap-unfiltered.tsv"), sep="\t", row.names=T, quote=F )
+
+```
+### Boxplot
+
+Using box plot we can visualize minimum, first quartile (Q1), median (Q2), third quartile (Q3), and maximum.
+
+```{r box-plot-unfiltered}
+## Convert to tidy format
+box.data.tidy           <- melt(cpm.data)
+colnames(box.data.tidy) <- c("Gene", "Sample", "logCPM")
+
+## add group info from exp.design
+box.data.tidy <- base::merge(box.data.tidy, meta.data, by= "Sample", x.all=T)
+
+bp1 <- ggplot(box.data.tidy,aes(x=Sample, y=logCPM, color= Group)) +
+  geom_boxplot(outlier.shape=NA) +
+  theme(axis.text.x=element_text(angle=90, hjust=0)) +
+  facet_grid(~Group,space = "free", scales = "free")
+
+bp1
+
+## save the plot
+ggsave(file.path(expo.plot.dir,"box-plot-unfiltered.png"), dp1, width=250,height=250,units="mm", dpi=300)
+
+## save the plot data
+write.table(box.data.tidy, file=file.path(expo.plot.data.dir,"box-plot-unfiltered.tsv"), sep="\t", row.names=F, quote=F )	
+
+```
+### Filtering
+
+Genes with low count provide very little evidence of them being differentially expressed. Thus, genes with low counts should be removed before performing further analysis. Low gene counts were filtered using edgeR’s `filterByExpr` function using default parameters. The function filters low count genes without introducing any bias into the data. 
+
+```{r filtering}
+## remove already normalized count data
+rm(count.data)
+
+## Create a DGEList
+count.data      <- DGEList( counts=data.matrix(dge), 
+                            samples=meta.data, 
+                            #genes=anno,
+                            group=meta.data$Group)
+
+keep 		        <- filterByExpr(count.data, group=count.data$samples$Group)
+count.data.filt	<- count.data[keep, , keep.lib.sizes=FALSE]
+
+## Calculate normalization factors to scale the raw library sizes. 
+count.data.filt <- calcNormFactors(count.data.filt, method="TMM")
+
+## count per million
+cpm.data.filt   <- cpm (count.data.filt, normalized.lib.sizes=TRUE, log=TRUE)
+
+```
+
+### PCA (filtered)
+
+In the following code block we are creating a PCA plot using the filtered data and viewing the unfiltered and filtered PCA plots side by side.
+
+```{r pca-filtered}
+pca <- prcomp(t(cpm.data.filt), scale=F, center=T)
+ylab <- paste("PC2 (Variance explained ", (summary(pca))$importance[2,2]*100, "%)")
+xlab <- paste("PC1 (Variance explained ", (summary(pca))$importance[2,1]*100, "%)")
+
+pca.plot.data <- as.data.frame( pca$x[,c("PC1", "PC2")] )
+pca.plot.data$Group <-  meta.data[rownames(pca.plot.data) %in% as.character(meta.data$Sample), "Group"] 
+pca.plot.data$label <-  rownames(pca.plot.data)
+
+pca2 <- ggplot(pca.plot.data, aes(x=PC1, y=PC2, label=label, color=Group)) + 
+  geom_point(alpha=0.4, stroke=1, size=4) +
+  geom_text_repel(color="#bbbbbb")+
+  labs(x = xlab, y = ylab) +
+  labs(color="label") 
+
+
+gridExtra::grid.arrange(pca1, pca2, ncol = 2)
+
+## save the plot
+ggsave(file.path(expo.plot.dir,"PCA-filtered.png"), pca2, width=350,height=300,units="mm", dpi=300)
+
+## save the plot data
+write.table(pca.plot.data, file=file.path(expo.plot.data.dir,"PCA-filtered.tsv"), sep="\t", row.names=T, quote=F )
+
+```
+
+### Density plot (filtered)
+
+Previously, we have generated a density plot from the unfiltered data. Here, we generate another density plot from the filtered data and view two (filtered and unfiltered) density plots side by side to check how the filtering has affected out count data.
+
+```{r density-plot-filtered}
+## expression density plot
+cpm.tidy <- reshape2::melt(cpm.data.filt)
+colnames(cpm.tidy) <- c("Gene", "Sample", "logCPM")
+
+## inspect the data frame
+head(cpm.tidy)
+
+dp2 <- ggplot(cpm.tidy, aes(x = logCPM, color = Sample)) + 
+  geom_line(stat = "density", alpha = 0.6) +
+  labs(x = "logCPM") + 
+  theme(legend.position = "none")
+
+## filtered and unfilterd density plots
+gridExtra::grid.arrange(dp1, dp2, ncol = 2)
+
+## save the plot
+ggsave(file.path(expo.plot.dir,"density-plot-filtered.png"), dp2, width=250,height=250,units="mm", dpi=300)
+
+## save the plot data
+write.table(pca.plot.data, 
+            file=file.path(expo.plot.data.dir,"density-plot-filtered.tsv"), 
+            sep="\t", 
+            row.names=T, 
+            quote=F )
+
+```
+
+### Exercise 1
+
+Create a boxplot from `cpm.data.filt`.
+
+* Convert `cpm.data.filt` to tidy format using `reshap2::melt()` or `tidyr::pivot_longer()`. If you use the second one, remember to move row names into a column using `tibble:rownames_to_column(var="Gene")` and remove the column `Gene` in the function `tidyr::pivot_longer()`.
+* Create a plot using ggplot.
+* Add a layer `geom_jitter` with `alpha=0.5` and suitable value for `size`.
+* Add a layer `geom_violin` with `alpha=0.5`.
+* Add a layer `geom_boxplot` with `alpha=0.5` and a suitable  value for `width`.
+
+```{r}
+## Convert to tidy format
+box.data.tidy           <- melt(cpm.data.filt)
+colnames(box.data.tidy) <- c("Gene", "Sample", "logCPM")
+
+## add group info from exp.design
+box.data.tidy <- base::merge(box.data.tidy, meta.data, by= "Sample", x.all=T)
+
+ggplot(box.data.tidy,aes(x=Sample, y=logCPM, color= Group)) +
+  theme(axis.text.x=element_text(angle=90, hjust=0)) +
+  facet_grid(~Group,space = "free", scales = "free") +
+  geom_jitter(alpha=0.5) +
+  geom_violin(alpha=0.5) +
+  geom_boxplot()
+
+```
+
+
+
+### Exercise 2
+
+Create a similarity heatmap using filtered count data.
+
+
+# Differential Gene Expression (DGE) Analysis
+The main goal of a differential gene expression analysis is to find differences between two experimental groups such as treatment and control in terms of genes and their expressions. As a result, we get a list of genes that are different in the compared groups and their degree of difference in log fold-change.
+
+In this analysis, genes expressed differentially between control and treatment groups is tested using exact tests from edgeR Bioconductor package. A null hypothesis (H0) of a test is there is no changes in the expression of a tested gene in two compared groups. Each genes we have got from low gene-count filtering step are tested for the hypothesis. Dispersion, a parameter of negative binomial model is calculated from the biological replicates. Tagwise (genewise) dispersion is used when the number is more than three.
+
+Sample group comparison HFD_KO vs. HFD_WT (HFD_KO - HFD_WT) is performed in the following code blocks. As an example, in a comparison groupB vs. groupA, expression of groupA is subtracted from expression of groupB (groupB - Group A). Thus, genes with positive log-fold change are up-regulated in groupB compared to groupA (and vice versa for genes with negative log-fold change).
+
+
+```{r DGE-analysis-set-dirs}
+## results directories for exploratory analysis
+dge.plot.dir       <- file.path(res.dir,"plots",     "DGE-analysis")
+dge.files.dir      <- file.path(res.dir,"files",     "DGE-analysis")
+dge.plot.data.dir  <- file.path(res.dir,"plots-data","DGE-analysis")
+
+## create directories
+dir.create(dge.plot.dir,      showWarnings = FALSE)
+dir.create(dge.files.dir,     showWarnings = FALSE)
+dir.create(dge.plot.data.dir, showWarnings = FALSE)
+
+## show directory structure
+fs::dir_tree(path = res.dir)
+```
+
+## BiomaRt
+
+Our count matrix contains only Ensembl gene identifiers (eg. `ENSMUSG00000064368`). These identifiers are less informative compared to gene names. In the following code block we are using Ensembl's biomaRt to gather `start_position`, `end_position`, `chromosome_name`, `external_gene_name`, `description`, `gene_biotype`, `hgnc_symbol` and `entrezgene_id.`
+
+```{r biomart-db}
+mart.db.file <- file.path("data","rnaseq","mart.db.RDS")
+if(file.exists(mart.db.file)){
+  mart.db <- readRDS( mart.db.file )
+  cat("\n BiomaRt DB loaded")
+}else{
+  ensembl		<- useEnsembl(biomart="ensembl", dataset="mmusculus_gene_ensembl", version=ens.ref.release)
+  mart.db	<- getBM(attributes <- c("ensembl_gene_id", "start_position", 
+                                    "end_position", "chromosome_name", 
+                                    "external_gene_name", "description", 
+                                    "gene_biotype", "hgnc_symbol", "entrezgene_id"), 
+                     #filters = "ensembl_gene_id", 
+                     #values = genes, 
+                     mart = ensembl, 
+                     uniqueRows=T)
+  
+  saveRDS (mart.db, file=file.path("data","rnaseq","mart.db.RDS") )
+}
+
+head(mart.db)
+
+```
+
+Once we know `gene_biotype`, there is an option to perform differential expression analysis only on the protein coding genes.
+
+## Use only protein coding genes (Optional)
+
+```{r protein-coding}
+## keep only protein_coding genes
+only.protein.coding = FALSE
+
+if(only.protein.coding)
+{
+  prot.cod <- mart.db[mart.db$gene_biotype=="protein_coding","ensembl_gene_id"]
+  
+  x                   <- rownames(count.data.filt$counts)
+  keep                <- x %in% prot.cod
+  count.data.protGene <- count.data.filt[keep , keep.lib.sizes=FALSE]
+  count.data.filt     <- count.data.protGene
+}
+
+```
+
+Finally, we test each genes for differential expression between the two groups.
+
+```{r diff-exp}
+count.data.filt <- estimateCommonDisp(count.data.filt, robust=TRUE)
+count.data.filt <- estimateTagwiseDisp(count.data.filt)
+
+## BCV: Biological variability in gene expression between replicates.
+plotBCV(count.data.filt)
+
+
+## Note that the first group listed in the pair is the baseline for the
+## comparison-so if the pair is ‘c("A","B")’ then the comparison is 
+## ‘B - A’, so genes with positive log-fold change are up-regulated in 
+## group B compared with group A and vice versa for genes with 
+## negative log-fold change.
+## 
+ctl.groups   <- unique(meta.data[meta.data$Control==1,'Group']) 
+treat.groups <- unique(meta.data[meta.data$Control==0,'Group'])
+
+  
+et <- exactTest(count.data.filt, pair=c("HFD_KO", "HFD_WT"), dispersion="tagwise")
+
+## get all features from the test
+deg <- topTags(et, n = "Inf")$table
+
+## save the DE genes
+
+## columns to remove
+drops		<- c("Chr", "Start", "End", "Strand", "Length")
+
+
+#dge.genes	<- deg$GeneID
+dge.genes <- rownames(deg)
+
+deg.ctl.vs.treat.anno	<- cbind(deg, mart.db[match(dge.genes, mart.db[,1]),
+                                            c("ensembl_gene_id", "chromosome_name",
+                                              "start_position", "end_position", 
+                                              "external_gene_name", 
+                                              "description", "gene_biotype")] )
+
+deg <- deg.ctl.vs.treat.anno[, !(names(deg.ctl.vs.treat.anno) %in% drops)] 
+
+write.table(deg, 
+            file=file.path(dge.files.dir,"DEGs-HFD_WT-vs-HFD_KO.tsv"), 
+            sep="\t", 
+            row.names=T, 
+            quote=F )
+
+head(deg)
+```
+
+## Filtering DE genes
+
+The genes with very low `logFC` and high `FDR` or `PValue` are often filtered out because they are less informative.
+
+```{r DEGs-filtering}
+## filtering threshold
+fdr.threshold    <- 0.05
+pvalue.threshold <- 0.005
+logfc.threshold  <- 0.25
+
+## filtering using FDR
+deg.filt <- deg [deg$FDR < fdr.threshold &  abs(deg$logFC) >= logfc.threshold,  ]
+
+## filtering using PValue
+deg.filt.pval <- deg [deg$PValue < pvalue.threshold &  abs(deg$logFC) >= logfc.threshold,  ]
+
+```
+
+## Volcano plot
+
+A volcano plot is a very common way to visualize differentially expressed DE genes. The x-axis has log fold-change and the y-axis has p-value or FDR.
+
+```{r volcano-plot}
+volcano.data  <- deg[,c( "logFC", "logCPM", "PValue", "FDR", "external_gene_name")]
+volcano.data$GeneID <- rownames(deg)
+
+## using FDR to label up-regulated, down-regulated and insignificant genes
+volcano.data$FDR_legend <- ifelse(deg$FDR < fdr.threshold, 
+                              ifelse(deg$logFC > logfc.threshold,"Up-regulated", 
+                                     ifelse(deg$logFC < -logfc.threshold,"Down-regulated","")) ,
+                              "Insignificant")
+
+## Using PValue to label up-regulated, down-regulated and insignificant genes
+volcano.data$PValue_legend <- ifelse(deg$PValue < pvalue.threshold, 
+                              ifelse(deg$logFC > logfc.threshold,"Up regulated", 
+                                     ifelse(deg$logFC < -logfc.threshold,"Down regulated","")) ,
+                              "Insignificant")
+
+## Volcano plot using filtered data (FDR)
+vp1 <- ggplot(volcano.data, aes(x=logFC, y= -log10(FDR), color=FDR_legend, label=external_gene_name)) + 
+  geom_point() +
+  scale_color_discrete(name="") +
+  geom_label_repel(data=subset( volcano.data, FDR < 0.001 &  abs(logFC) >  1), color="#bbbbbb"  )+
+  theme(text = element_text(size = 15), legend.text=element_text(size=15))
+
+vp1
+
+## Volcano plot using filtered data (PValue)
+vp2 <- ggplot(volcano.data, aes(x=logFC, y= -log10(PValue), color=PValue_legend, label=external_gene_name)) + 
+  geom_point() +
+  scale_color_discrete(name="") +
+  geom_label_repel(data=subset( volcano.data, PValue < 0.001 &  abs(logFC) >  1), color="#bbbbbb"  )+
+  theme(text = element_text(size = 15), legend.text=element_text(size=15))
+
+vp2
+
+## save the plots
+ggsave(file.path(dge.plot.dir,"volcano-plot-pvalue-HFD_WT-vs-HFD_KO.png"), vp1, width=250,height=250,units="mm", dpi=300)
+ggsave(file.path(dge.plot.dir,"volcano-plot-fdr-HFD_WT-vs-HFD_KO.png"), vp2, width=250,height=250,units="mm", dpi=300)
+
+## save the plot data
+write.table(volcano.data, file=file.path(dge.plot.data.dir,"volcano-plot-HFD_WT-vs-HFD_KO.tsv"), sep="\t", row.names=T, quote=F )
+```
+
+We can also view the number of insignificant and significant (up and down regulated) genes based on both `PValue` and `FDR`.
+
+```{r}
+table(volcano.data$PValue_legend)
+table(volcano.data$FDR_legend)
+```
+
+
+## Distribution of biotypes
+
+When we are not working only on protein coding genes, a pie chart of biotypes can be very informative. The following code produces a pie chart showing proportion of different biotypes of the filtered DE genes.
+
+```{r piechart-biotypes}
+  pie.data <- deg.filt.pval %>% count(gene_biotype)
+  
+  head(pie.data)
+
+  bt1 <- ggplot(pie.data, aes(x = "", y = n, fill = gene_biotype)) +
+    geom_col() +
+    geom_text(aes(x = 1.6, label = n),
+              position = position_stack(vjust = 0.5), size=2)+
+    coord_polar(theta = "y") +
+    guides(fill=guide_legend(title="Gene biotype")) +
+    xlab("")+
+    ylab("")
+  
+  #show the plot
+  bt1
+  
+  ## save the plot
+  ggsave(file.path(dge.plot.dir,"biotypes-HFD_WT-vs-HFD_KO-filtered.png"), bt1, width=250,height=250,units="mm", dpi=300)
+  
+  ##save the plot data
+  write.table(pie.data, file=file.path(dge.plot.data.dir,"biotypes-HFD_WT-vs-HFD_KO.tsv"), sep="\t", row.names=T, quote=F )
+
+
+```
+
+## DE genes heatmap
+
+If it often informative to visualize the expression profile of the top gene from both case and control groups.
+
+```{r top-DE-genes}
+
+## subset expression matrix by the significant DE genes
+cpm.data.sub <- cpm.data[  rownames(deg.filt),]
+
+
+## heatmap
+## Annotation
+ha <- HeatmapAnnotation(df=data.frame(Group=meta.data$Group, 
+                                     Control=as.character(meta.data$Control))
+                        ) 
+plot(ha)
+
+ 
+## Heatmap
+h1 <-  Heatmap(
+  as.matrix(cpm.data.sub),
+  name = "logCPM",
+  col = brewer.pal(4, "RdYlBu"),
+  na_col = "black",
+  show_row_dend = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  top_annotation = ha,
+  row_dend_reorder = T,
+  cluster_rows = T,
+  cluster_columns = T,
+  row_names_side = "left",
+  column_names_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 10)
+)
+
+h1
+
+## save the plot
+png(filename = file.path(dge.plot.dir,"DEG-heatmap.png"), width=230, height=200, res=300,units="mm")
+draw(h1)
+dev.off()
+
+
+## save the plot data
+write.table(eu.dist, file=file.path(dge.plot.data.dir,"DEG-heatmap.tsv"), sep="\t", row.names=T, quote=F )
+
+```
+## Exercise 3
+- Change row names in the heatmap to the format for example `ENSMUSG00000081174 (Gm13439)`.
+- Add row annotation sex
+```{r}
+## gene names
+merged <- merge(deg.filt, mart.db, by="ensembl_gene_id",sort=F)
+merged <- merged[,c("ensembl_gene_id", "external_gene_name.x")]
+
+gene.names <- paste0(merged$ensembl_gene_id," (",merged$external_gene_name.x,")")
+rownames(cpm.data.sub) <- gene.names
+
+## Annotation
+ha <- HeatmapAnnotation(df=data.frame(Group=meta.data$Group, 
+                                     Control=as.character(meta.data$Control))
+                        ) 
+
+
+Heatmap(
+  as.matrix(cpm.data.sub),
+  name = "logCPM",
+  col = brewer.pal(4, "RdYlBu"),
+  na_col = "black",
+  show_row_dend = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  top_annotation = ha,
+  row_dend_reorder = T,
+  cluster_rows = T,
+  cluster_columns = T,
+  row_names_side = "left",
+  column_names_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 10)
+)
+```
+
+
+## Exercise 4
+
+- Create a MA plot using ggplot. Use either Google or AI to figure what is a MA plot.
+```{r}
+ma.data <- volcano.data
+
+fdr.threshold    <- 0.05
+pvalue.threshold <- 0.005
+logfc.threshold  <- 0.25
+
+
+data.sig    <- subset(ma.data, PValue_legend != "Insignificant")
+data.nonsig <- subset(ma.data, PValue_legend == "Insignificant")
+
+ggplot(ma.data,aes(x=logCPM, y=logFC, label=external_gene_name, color=PValue_legend)) +
+    geom_point(data= data.sig ,alpha=0.8, color="#56B4E9") +
+    geom_point(data= data.nonsig ,alpha=0.8, color="#E69F00") +
+    
+    
+    geom_segment(aes(x=min(logCPM), y=logfc.threshold, xend=max(logCPM), yend=logfc.threshold),linetype=2, color="#AAAAAA" ) +
+    geom_segment(aes(x=min(logCPM), y=-logfc.threshold, xend=max(logCPM), yend=-logfc.threshold),linetype=2, color="#AAAAAA" ) +
+    
+    coord_cartesian() +
+    ylab("log2 FC") +
+    xlab("log2 CPM")
+```
+
+## Exercise 5
+
+Extend the previously generated volcano-plot using `PValue` which has thresholds `pvalue.threshold <- 0.005`, and `logfc.threshold  <- 0.25`.
+
+- Add a line segment parallel to the x-axis that shows `PValue` threshold.
+- Add a line segment parallel to the y-axis that shows `logfc.threshold < 0.05` threshold. 
+- Add a line segment parallel to the y-axis that shows `logfc.threshold > 0.05` threshold.
+```{r}
+ggplot(volcano.data, aes(x=logFC, y= -log10(PValue), color=PValue_legend, label=external_gene_name)) + 
+  geom_point() +
+  scale_color_discrete(name="") +
+  geom_label_repel(data=subset( volcano.data, PValue < 0.001 &  abs(logFC) >  1), color="#bbbbbb"  )+
+  geom_hline(yintercept = -log10(0.005), color = "grey", linetype = "dashed") +
+  geom_vline(xintercept = -0.25, color = "grey", linetype = "dashed") +
+  geom_vline(xintercept = 0.25, color = "grey", linetype = "dashed") +
+  theme(text = element_text(size = 15), legend.text=element_text(size=15))
+```
+
+
+## Exercise 6
+
+Use the following thresholds and report number of significant up-regulated and download-regulate genes.
+
+- `pvalue.threshold < 0.001`
+- `logfc.threshold  > 0.15` and `logfc.threshold  > -0.15`
+```{r}
+pvalue.threshold <- 0.01
+logfc.threshold  <- 0.15
+
+## filter
+deg.filt2.pval <- deg [deg$PValue < pvalue.threshold &  abs(deg$logFC) >= logfc.threshold,  ]
+
+## up-regulated
+nrow(deg.filt2.pval [deg.filt2.pval$logFC >0,])
+nrow(deg.filt2.pval [deg.filt2.pval$logFC <=0,])
+```
+
+## Exercise 7
+
+Convert the following `entrezgene_id` to `ensembl_gene_id` and `external_gene_name` from `mart.db`.
+
+Entrez_id: 56361, 100041953, 69784, 258684
+
+```{r}
+query.ids <- c(56361, 100041953, 69784, 258684)
+
+mart.db[mart.db$entrezgene_id %in% query.ids, c("entrezgene_id","ensembl_gene_id", "external_gene_name")]
+
+```
+
+# Gene set enrichment analysis (GSEA)
+
+## Using [DAVID](https://davidbioinformatics.nih.gov/summary.jsp)
+
+Before using DAVID we have to save the significant genes into a file.
+
+```{r sig-genes}
+sig.genes <- data.frame( genes=rownames(volcano.data[volcano.data$PValue_legend!="Insignificant",]) )
+
+write.table(sig.genes, file=file.path(dge.files.dir,"sig-genes.tsv"), sep="\t", row.names=F, quote=F )
+
+```
+
+Now, open the file from RStudio's Files tab, copy all the Ensembl gene IDs in David's interface.
+
+In the interface
+- Step 1: Paste the gene list.
+- Step 2: Select ENSEMBL_GNE_ID
+- Step 3: Select "Gene List"
+- Step 4: Press "Submit List"
+
+In the new interface, 
+
+- Select "Mus musculus" as a species.
+- Press "Clear All" button on the right.
+- Select the following from Gene_Ontology
+  - GOTERM_BP_DIRECT 
+  - GOTERM_CC_DIRECT
+  - GOTERM_MF_DIRECT
+- Select the following from Pathways
+  - BIOCARTA   
+  - KEGG_PATHWAY  
+  - REACTOME_PATHWAY 
+  
+Now, check "Functional Annotation Chart"
+
+You can perform similar analysis in [https://geneontology.org/](https://geneontology.org/) as well. [Reactome](https://reactome.org/PathwayBrowser/#TOOL=AT) is a good resource for pathway analysis as well.
+
+
+## Using R (optional)
+
+Filtered DE genes are often tested for their over-representation in biological pathways. Here we test the over-representation in Gene
+Ontology (GO) terms. Ontology is a structured and controlled classes/terms describing gene products known as GO terms. GO has three following top-level non-overlapping ontologies. For details on Gene Ontology please visit [http://geneontology.org](http://geneontology.org).
+• Molecular Function (MF)
+• Biological Process (BP)
+• Cellular Component (CC)
+
+We are using topGO, a Bioconductor package to perform Gene-set enrichment analysis. 
+
+
+```{r GSEA-set-dirs}
+## results directories for exploratory analysis
+gsea.plot.dir       <- file.path(res.dir,"plots",     "GSEA")
+gsea.files.dir      <- file.path(res.dir,"files",     "GSEA")
+gsea.plot.data.dir  <- file.path(res.dir,"plots-data","GSEA")
+
+## create directories
+dir.create(gsea.plot.dir,      showWarnings = FALSE)
+dir.create(gsea.files.dir,     showWarnings = FALSE)
+dir.create(gsea.plot.data.dir, showWarnings = FALSE)
+
+## show directory structure
+fs::dir_tree(path = res.dir)
+```
+Once more we are using biomaRt to get genes and go_id associated to the them.
+
+```{r mart-gene2go}
+gene2go.file <- file.path("data","rnaseq","gene2go.RDS")
+
+  if( !file.exists(gene2go.file) )
+  {
+    ensembl = useEnsembl(biomart="ensembl", dataset="mmusculus_gene_ensembl", version=ens.ref.release)
+    # Get ensembl gene ids and GO terms
+    gene2go <- getBM(attributes=c("ensembl_gene_id", "external_gene_name", "go_id", "name_1006", "namespace_1003"),  mart = ensembl)
+    ## remove rows with blank GO terms
+    gene2go <- gene2go[gene2go$go_id != '',]
+    
+    ## save to file
+    saveRDS (gene2go, file=gene2go.file)
+  } else {
+    #load from file
+    gene2go <- readRDS(gene2go.file)
+  }
+
+## head
+head(gene2go)
+
+```
+
+
+```{r}
+ontology="BP"
+
+go.plots.dir = file.path(gsea.plot.data.dir, "Gene-ontology")
+
+if(ontology=="BP")
+  go.sub.plots.dir <- file.path(go.plots.dir,"Biological-processes")
+if(ontology=="MF")
+  go.sub.plots.dir <- file.path(go.plots.dir,"Molecular-functions")
+if(ontology=="CC")
+  go.sub.plots.dir <- file.path(go.plots.dir,"Cellular-components")
+
+
+```
+
+
+```{r message=FALSE}
+## background and candidate genes
+bg.genes 	 <- count.data$genes$GeneID
+cnd.genes  <- deg.filt.pval$GeneID
+# remove any candidate genes without GO annotation
+keep 	 <- cnd.genes %in% gene2go[,1]
+keep  	 <- which(keep==TRUE)
+cnd.genes  <- cnd.genes[keep]
+
+
+# make named factor showing which genes are of interest
+geneList <- factor(as.integer(bg.genes %in% cnd.genes))
+names(geneList) <-  bg.genes
+
+
+## make topGO data object
+# build the gene 2 GO annotation list (needed to create topGO object)
+gene_2_GO <- unstack(gene2go[,c(3,1)])
+GOdata    <- new(
+  'topGOdata',
+  ontology = "BP",
+  allGenes = geneList,
+  annot = annFUN.gene2GO,
+  gene2GO = gene_2_GO
+)
+
+
+## Test for significance
+# define test using the weight01 algorithm (default) with fisher
+weight.fisher.res <- runTest(GOdata, algorithm='weight01', statistic='fisher') 
+
+# generate a table of results: we can use the GenTable function to generate a summary table with the results from tests applied to the topGOdata object.
+allGO <- usedGO(GOdata)
+all.res <- GenTable(GOdata, weightFisher=weight.fisher.res, orderBy='weightFisher', topNodes=length(allGO))
+
+
+## Correcting for multiple testing
+#performing BH correction on our p values
+## remove < 1e-30
+all.res$weightFisher <- gsub("< ","", all.res$weightFisher)
+p.adj <- round(p.adjust(all.res$weightFisher,method="BH"),digits = 4)
+
+# create the file with all the statistics from GO analysis
+all.res.final <- cbind(all.res,p.adj)
+colnames(all.res.final)[6] <- "p.value"
+all.res.final <- all.res.final[order(all.res.final$p.adj),]
+
+#get list of significant GO after multiple testing correction
+results.table.bh <- all.res.final[which(all.res.final$p.value<=0.05),]
+
+
+```
+### Rich plot
+
+Rich plot is a common way to visualize pathways.
+
+```{r}
+## Make rich factor plot.data
+plot.data           <- all.res.final[all.res.final$p.value <= 0.05,]
+plot.data$ratio     <- plot.data$Significant/plot.data$Annotated
+plot.data$p.value    <- as.numeric(plot.data$p.value)
+colnames(plot.data) <- c("GO.ID", "Term", "Annotated", "Count", "Expected", "p.value", "p.adj", "Ratio")
+
+## if there are any significant terms
+pp2 <- ggplot(plot.data , 
+              aes(Ratio, Term)) +
+  geom_segment(aes(xend=0, yend = Term)) +
+  geom_point(aes(color=p.value, size = Count)) +
+  scale_color_viridis_c(guide=guide_colorbar(reverse=TRUE)) +
+  scale_size_continuous(range=c(2, 10)) +
+  xlab("Rich factor")
+
+pp2
+```
+
+### Exercise 7
+
+Rerun topGO analysis for Molecular-functions (MF) and create a rich plot.
+

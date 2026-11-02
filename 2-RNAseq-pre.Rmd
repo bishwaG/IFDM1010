@@ -1,0 +1,296 @@
+---
+title: "RNASeq data pre-processing"
+author: "Bishwa Ghimire"
+date: "2026-09-13"
+output: 
+  html_document: 
+  toc: true
+number_sections: true
+---
+  
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+# git config --global --add safe.directory /home/rstudio/my-work
+# git config --global user.email "bishwa.ghimire@utu.fi"
+# git config --global user.name "Bishwa Ghimire"
+```
+
+
+# Introduction
+
+This document describes a basic RNA-seq preprocessing workflow using R and Bioconductor tools. The workflow includes downloading paired-end FASTQ files, obtaining a reference genome and gene annotation, assessing read quality, filtering and trimming reads, aligning reads to the reference genome, and generating gene-level count data.
+
+The example dataset is obtained from the nf-core RNA-seq test datasets. It is intended to demonstrate the main stages of an RNA-seq analysis workflow.
+
+The analysis consists of the following steps:
+
+- Download raw sequencing reads.
+- Download and prepare the reference genome and gene annotation.
+- Assess raw read quality.
+- Filter low-quality reads and trim adapters.
+- Align the processed reads to the reference genome.
+- Count reads overlapping annotated genes.
+- Save the gene-level count matrix and inspect alignment and counting statistics.
+
+# Software requirements
+
+The workflow uses the following R packages:
+
+- ShortRead: quality assessment of FASTQ files.
+- Rfastp: read filtering and adapter trimming.
+- Rsubread: reference indexing, RNA-seq alignment, and gene-level read counting.
+- BiocManager: installation of Bioconductor packages.
+
+
+Install missing packages:
+```{r message=FALSE}
+BiocManager::install(c(
+    "ShortRead",
+    "Rsubread",
+    "Rfastp"
+))
+```
+
+
+# Data Download
+
+The first step is to download the sequencing data and the reference files required for read alignment and gene counting.
+
+The workflow uses paired-end sequencing data. Each biological fragment is represented by two reads, commonly referred to as read 1 (R1) and read 2 (R2).
+
+The directory structure separates the raw sequencing data, quality-control reports, reference files, alignment results, and gene-count output. Keeping these files in separate directories helps organize the analysis and makes intermediate results easier to inspect.
+
+## FASTQ files
+
+FASTQ files contain nucleotide sequences and their corresponding base quality scores. Quality scores indicate the confidence associated with each base call.
+
+The two FASTQ files downloaded below contain the paired-end reads for the example sample, SRR6357070. The files are stored in the fastq directory.
+
+The QC directory is created at the same time to store quality-control reports generated in subsequent steps.
+
+```{r}
+dir.create("/home/rstudio/my-work/preprocess/fastq", recursive = T)
+dir.create("/home/rstudio/my-work/preprocess/QC", recursive = T)
+
+download.file("https://raw.githubusercontent.com/nf-core/test-datasets/rnaseq/testdata/GSE110004/SRR6357070_1.fastq.gz",
+              destfile = "/home/rstudio/my-work/preprocess/fastq/SRR6357070_1.fastq.gz",
+              method = "wget")
+
+download.file("https://raw.githubusercontent.com/nf-core/test-datasets/rnaseq/testdata/GSE110004/SRR6357070_2.fastq.gz",
+              destfile = "/home/rstudio/my-work/preprocess/fastq/SRR6357070_2.fastq.gz",
+              method = "wget")
+```
+
+# Reference genome
+
+Read alignment requires a reference genome against which the sequencing reads can be mapped. Gene-level quantification additionally requires a gene annotation file describing the genomic locations of genes and their constituent features.
+
+In this example, the reference genome is provided as a FASTA file, while gene annotations are provided in GTF format.
+
+The FASTA file contains the reference nucleotide sequences. The GTF file contains genomic coordinates and annotation attributes, including gene identifiers and exon locations. Both files are downloaded in compressed format and then decompressed for use by the downstream tools. The reference genome and annotation must be compatible: the chromosome or contig names in the GTF file should correspond to those in the FASTA file.
+
+```{r}
+
+## Reference dir
+dir.create("/home/rstudio/my-work/preprocess/ref")
+
+download.file("https://raw.githubusercontent.com/nf-core/test-datasets/rnaseq/reference/genome.fa.gz",
+  "/home/rstudio/my-work/preprocess/ref/genome.fa.gz",
+  mode = "wb",
+  method = "wget")
+
+download.file(
+  "https://raw.githubusercontent.com/nf-core/test-datasets/rnaseq/reference/genes.gtf.gz",
+  "/home/rstudio/my-work/preprocess/ref/genes.gtf.gz",
+  mode = "wb",
+  method = "wget")
+
+## decompress
+system("gunzip /home/rstudio/my-work/preprocess/ref/genome.fa.gz")
+system("gunzip /home/rstudio/my-work/preprocess/ref/genes.gtf.gz")
+
+```
+
+
+# Quality control
+
+Quality control (QC) is performed before filtering to evaluate the quality and characteristics of the raw sequencing reads.
+
+The QC analysis can help identify:
+
+- The number of reads in each FASTQ file.
+- The distribution of base quality scores.
+- The nucleotide composition of reads.
+- Potential sequencing-quality problems.
+- Differences in read characteristics between R1 and R2.
+
+These results can help determine whether adapter trimming or quality filtering is needed and whether the data exhibit any unusual characteristics.
+
+## Raw read quality assessment
+
+The ShortRead package provides tools for examining sequencing data. The qa() function generates quality-assessment summaries from the FASTQ files, and report() creates an HTML report for inspection. The resulting report should be reviewed before proceeding to filtering. In particular, examine the distribution of base quality scores across read positions and check whether the quality deteriorates toward the ends of reads.
+
+```{r}
+
+library(ShortRead)
+
+files <- c(
+    "/home/rstudio/my-work/preprocess/fastq/SRR6357070_1.fastq.gz",
+    "/home/rstudio/my-work/preprocess/fastq/SRR6357070_2.fastq.gz"
+)
+
+# Summarize read counts, base composition and quality
+qc <- qa(files, type = "fastq")
+print(qc)
+
+# Generate an HTML quality report
+report(qc, dest = "/home/rstudio/my-work/preprocess/QC")
+
+# open te report
+browseURL("/home/rstudio/my-work/preprocess/QC/index.html")
+```
+
+
+# Filtering and adapter trimming
+
+Raw sequencing reads can contain adapter sequences, low-quality bases, and reads with insufficient usable sequence. These issues can reduce alignment accuracy and affect downstream gene quantification.
+
+The filtering step uses Rfastp to process the paired-end FASTQ files. The specified settings enable adapter trimming, sliding-window quality trimming, quality-based filtering, filtering based on ambiguous bases, and minimum read-length filtering.
+
+The settings in this example include:
+
+- Adapter trimming enabled.
+- Sliding-window trimming using a window of four bases and a quality threshold of 20.
+- Quality filtering with a Phred threshold of 20.
+- Filtering based on the proportion of bases meeting the specified quality criteria.
+- Filtering based on the number of ambiguous bases.
+- A minimum retained read length of 75 bases.
+
+The processed reads are written to the fastq-trimmed directory. These reads are used as input for the subsequent alignment step.
+
+Filtering parameters should be selected according to the sequencing protocol and the quality of the data. Excessively stringent filtering can discard useful reads, whereas insufficient filtering may retain low-quality sequences that interfere with alignment.
+
+```{r}
+
+library(Rfastp)
+
+fastq.dir <- "/home/rstudio/my-work/preprocess/fastq"
+out.dir   <- "/home/rstudio/my-work/preprocess/fastq-trimmed"
+
+dir.create(out.dir, recursive = TRUE, showWarnings = FALSE)
+
+R1 <- file.path(fastq.dir, "SRR6357070_1.fastq.gz")
+R2 <- file.path(fastq.dir, "SRR6357070_2.fastq.gz")
+
+stopifnot(file.exists(R1), file.exists(R2))
+
+result <- Rfastp::rfastp(
+  read1 = R1,
+  read2 = R2,
+  outputFastq = file.path(out.dir, "SRR6357070"),
+  adapterTrimming = TRUE,
+  cutSlideWindowRight = TRUE,
+  cutSlideWindowSize = 4,
+  cutSlideWindowQual = 20,
+  qualityFiltering = TRUE,
+  qualityFilterPhred = 20,
+  qualityFilterPercent = 40,
+  maxNfilter = 5,
+  lengthFiltering = TRUE,
+  minReadLength = 75,
+  thread = 4,
+  verbose = TRUE
+)
+```
+
+
+## Alignment and gene count
+
+After filtering, the reads are aligned to the reference genome. Alignment identifies the genomic locations supported by the sequencing reads and generates a BAM file containing the alignment records.
+
+The Rsubread package is used for both alignment and gene-level quantification. The workflow first builds an index of the reference genome, then aligns the paired-end reads, and finally counts reads overlapping annotated genomic features.
+
+## Reference indexing
+
+A reference index allows the aligner to locate matching genomic sequences efficiently. The index is constructed from the reference FASTA file and stored in the ref_index directory. The index must be built from the same reference genome used for the subsequent alignment and must remain compatible with the annotation used for counting.
+
+## RNA-seq alignment
+
+The align() function maps the paired-end reads to the reference genome using RNA-seq alignment settings. The output is written in BAM format, which stores alignment coordinates, mapping information, and other read-related metadata. The resulting BAM file is an intermediate result that can be used for downstream analyses, including alignment-quality assessment, visualization of genomic coverage, and gene-level quantification. Important alignment metrics include the overall alignment rate, the proportion of uniquely mapped reads, the proportion of multimapping reads, and the number of properly paired reads. These metrics help evaluate how well the sequencing data correspond to the selected reference genome.
+
+## Gene-level quantification
+
+The featureCounts() function assigns reads to annotated genomic features. In this example, the GTF annotation is used to count reads overlapping exons, with gene_id identifying the genes. Because the data are paired-end, the analysis specifies that the reads represent paired-end fragments and that read pairs should be counted together. This avoids treating the two mates of a single fragment as two independent fragments.
+
+The resulting count matrix contains gene-level counts for the sample. The counting summary, fc$stat, provides information about the assignment of reads to annotated features and can be used to evaluate the quantification results.
+
+The resulting gene counts can be used in downstream differential expression analysis, after appropriate normalization and statistical modeling. For differential expression analysis, counts from multiple biological samples are generally required.
+
+```{r}
+library(Rsubread)
+
+ref           <- "/home/rstudio/my-work/preprocess/ref/genome.fa"
+gtf           <- "/home/rstudio/my-work/preprocess/ref/genes.gtf"
+r1            <- "/home/rstudio/my-work/preprocess/fastq-trimmed//SRR6357070_R1.fastq.gz"
+r2            <- "/home/rstudio/my-work/preprocess/fastq-trimmed//SRR6357070_R2.fastq.gz"
+ref.index     <- "/home/rstudio/my-work/preprocess/ref_index/index"
+alignment.out <- "/home/rstudio/my-work/preprocess/alignment"
+feat.out      <- "/home/rstudio/my-work/preprocess/featurecount"
+
+## create output dirs
+dir.create(ref.index, recursive = T)
+dir.create(alignment.out)
+dir.create(feat.out)
+
+# Build index
+buildindex(basename = ref.index, reference = ref)
+
+# RNA-seq alignment
+Rsubread::align(
+  index = ref.index,
+  readfile1 = r1,
+  readfile2 = r2,
+  type = "rna",
+  input_format = "gzFASTQ",
+  output_format = "BAM",
+  output_file = file.path(alignment.out,"SRR6357070.bam"),
+  nthreads = 10
+)
+
+# Gene-level counting
+fc <- featureCounts(
+    files = file.path(alignment.out,"SRR6357070.bam"),
+    annot.ext = gtf,
+    isGTFAnnotationFile = TRUE,
+    GTF.featureType = "exon",
+    GTF.attrType = "gene_id",
+    isPairedEnd = TRUE,
+    countReadPairs = TRUE,
+    nthreads = 10
+)
+
+write.csv(
+    fc$counts,
+    file.path(feat.out,"gene_counts.csv")
+)
+
+fc$stat
+```
+
+
+
+## Results and quality assessment
+
+After the workflow has completed, review the output files and the summary statistics produced at each stage.
+
+The principal outputs are:
+
+Raw FASTQ files: the original paired-end sequencing reads.
+QC report: an HTML summary of raw read quality.
+Filtered FASTQ files: reads remaining after adapter trimming and quality filtering.
+Reference genome and annotation: the FASTA and GTF files used for alignment and quantification.
+Alignment BAM file: the genomic alignments of the filtered reads.
+Gene count matrix: the gene-level counts saved as gene_counts.csv.
+Feature-count statistics: the number of reads assigned and not assigned to annotated features.
+
+The gene count matrix should be checked for missing or unexpected values and should contain the expected gene identifiers. Alignment and counting statistics should be reviewed before using the results in downstream analyses.
