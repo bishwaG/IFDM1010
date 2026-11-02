@@ -1,0 +1,1668 @@
+---
+title: "Single-cell RNASeq data analysis"
+author: "Bishwa Ghimire"
+date: "2026-11-02"
+output: 
+  html_document: 
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Cellranger
+
+In the course we are using single-cell RNAseq data generated using Chromium platform from 10X Genomics. After sequencing is done, count data is generated using 10X's Cellranger software. Cellranger has two commonly used workflows `count` and `aggr`. The `count` workflow is used to generate sample-wise gene count results whereas `aggr` is used to normalize (by sequencing depth) the count data and generate aggregated gene counts from multiple samples. Output directory structure between `count` and `aggr` pipelines differs slightly. 
+
+# Data
+
+We are using dataset from Ianevski et al (2021). Following tables shows metadata of the data-set.
+
+|Patient sample|Disease stage|Age|Sex|ScRNA-based blast (%)|Clinical morphological blast (%)|Diagnosis (ICD-O)|FAB type*|Previous malignancies or predisposing conditions|Risk class at the time of  diagnosis|Potential driver mutations  |Treatment history                    |
+|--------------|-------------|---|---|---------------------|--------------------------------|-----------------|---------|------------------------------------------------|------------------------------------|----------------------------|-------------------------------------|
+|AML1_D        |Diagnosis    |35 |M  |68                   |65                              |AML, C92, 9874   |M2       |No                                              |Low                                 |WT1, CCND2, and CEBPA       |Cytarabine- 0idarubicin, lenalidomide|
+|AML2_R        |Refractory   |68 |M  |26                   |40                              |AML C92, 9920    |NA       |Non-Hodgkin’s lymphoma                          |Intermediate                        |DNMT3A, ERG, U2AF1, and BCOR|Cytarabine-idarubicin, azacytidine   |
+|AML3_D        |Diagnosis    |70 |F  |35                   |70                              |AML C92          |M1       |Non-Hodgkin’s lymphoma                          |Intermediate                        |NPM1 and TET2               |Azacitidine                          |
+|AML3_R        |Refractory   |71 |F  |56                   |42                              |AML, C92         |M1       |Non-Hodgkin’s lymphoma                          |Intermediate                        |NPM1, TET2, and HDAC 1,2,7  |Azacitidine-venetoclax               |
+
+
+# Data import, QC and Normalization
+
+In this section we will import single-cell RNAseq data, perform quality control and normalization.
+
+Participants are expected to watch lecture videos of the following modules from [https://uppsala.instructure.com/courses/52011/modules](https://uppsala.instructure.com/courses/52011/modules).
+
+- Single Cell Technologies
+- Quality Control
+- Normalization
+
+# Set output directories
+
+In the following code block creates output directories for storing files and plots in a logical structure.
+
+```{r create-directories}
+out.dir        <- file.path("results")
+res.dir        <- file.path(out.dir, "sc-rnaseq")
+robj.dir       <- file.path(res.dir,"robj")
+plot.dir       <- file.path(res.dir,"plots")
+files.dir      <- file.path(res.dir,"files")
+plot.data.dir  <- file.path(res.dir,"plots-data")
+  
+  ## create dirs
+  dirs <- c(res.dir, robj.dir, plot.dir, files.dir, plot.data.dir)
+  
+  for(dir in dirs){
+    dir.create(dir, showWarnings = FALSE)
+  }
+  
+```
+
+## Using sample-wise count data
+
+The directory `data/sc-rnaseq/counts` contains count data from individual samples which is not normalized by sequencing depth. Following is the directory structure generated using Cellranger `count` workflow for sample `AML1_D`. In this course we use data from `filtered_gene_bc_matrices` directory which is filtered data (possible empty droplets removed). If you prefer to do your own filtering using UMI or look into the gene content of empty droplets (according to Cellranger), use data from `raw_gene_bc_matrices` directory.
+
+
+```
+user@node1 ~$ ll AML1_D/outs
+total 23044372
+drwxr-xr-x 6 user cluster_users        4096 Jun 28  2019 analysis
+-rwxr-x--- 1 user cluster_users    26776276 Oct  5  2018 cloupe.cloupe
+drwxr-xr-x 3 user cluster_users        4096 Jun 28  2019 filtered_gene_bc_matrices
+-rwxr-x--- 1 user cluster_users     5845634 Oct  5  2018 filtered_gene_bc_matrices_h5.h5
+-rwxr-x--- 1 user cluster_users         579 Oct  5  2018 metrics_summary.csv
+-rwxr-x--- 1 user cluster_users   215204188 Oct  5  2018 molecule_info.h5
+-rwxr-x--- 1 user cluster_users 23230838144 Oct  5  2018 possorted_genome_bam.bam
+-rwxr-x--- 1 user cluster_users     6837728 Oct  5  2018 possorted_genome_bam.bam.bai
+drwxr-xr-x 3 user cluster_users        4096 Jun 28  2019 raw_gene_bc_matrices
+-rwxr-x--- 1 user cluster_users    15548358 Oct  5  2018 raw_gene_bc_matrices_h5.h5
+-rwxr-x--- 1 user cluster_users     3776970 Oct  5  2018 web_summary.html
+```
+### Data format
+
+Cellranger produces count data in sparse format which consists of 3 files. For sparse matrix manipulation (eg. import, export) in R please refer to `Matrix` library and its functions. 
+
+* barcodes.tsv.gz
+* features.tsv.gz
+* matrix.mtx.gz
+
+#### Cellbarcodes
+
+The file `barcodes.tsv.gz` contains cell barcodes.
+
+> NOTE: Following is a bash code. Ignore the error "gzip: stdout: Broken pipe"
+
+```{bash barcodes, echo=FALSE}
+DATA_DIR="/home/rstudio/abptds/data/sc-rnaseq/count"
+SAMPLE="AML1_D"
+
+echo "HEAD:"
+zcat $DATA_DIR/$SAMPLE/barcodes.tsv.gz | head -n 4
+
+echo -e "\nTAIL:"
+zcat $DATA_DIR/$SAMPLE/barcodes.tsv.gz | tail -n 4
+
+## check running numbers
+echo -e "\nsample IDs"
+zcat $DATA_DIR/$SAMPLE/barcodes.tsv.gz | cut -d "-" -f2 | sort | uniq
+```
+
+#### Features
+
+The file `features.tsv.gz` contains feature names (in our case gene names in first and second column) and data type (in third column). 
+
+> NOTE: Following is a bash code.
+
+```{bash features}
+SAMPLE="AML1_D"
+
+DATA_DIR="/home/rstudio/abptds/data/sc-rnaseq/count"
+zcat $DATA_DIR/$SAMPLE/features.tsv.gz | head
+```
+
+#### Data matrix
+
+The file `matrix.mtx.gz` contains row position, column position and gene count for each gene. It contains non-zero counts.
+
+> NOTE: Following is a bash code.
+
+
+```{bash matrix}
+SAMPLE="AML1_D"
+
+DATA_DIR="/home/rstudio/abptds/data/sc-rnaseq/count"
+zcat $DATA_DIR/$SAMPLE/matrix.mtx.gz | head
+```
+
+
+```{r count-data-loading, warning=FALSE}
+suppressMessages(library(Seurat))
+suppressMessages(library(gridExtra))
+suppressMessages(library(ggplot2))
+suppressMessages(library(glmGamPoi))
+
+
+#############
+data.dir <- "/home/rstudio/abptds/data/sc-rnaseq"
+
+## data location of each sample
+aml1.d.data <- Read10X(data.dir = file.path(data.dir, "count", "AML1_D"))
+aml2.r.data <- Read10X(data.dir = file.path(data.dir, "count", "AML2_R"))
+aml3.d.data <- Read10X(data.dir = file.path(data.dir, "count", "AML3_D"))
+aml3.r.data <- Read10X(data.dir = file.path(data.dir, "count", "AML3_R"))
+
+## create Seurat object of each samples
+## It subsets original matrix if non-zeros values are provided to min.cells and  min.features
+## min.cells   : Include features detected in at least this many cells
+## min.features: Include cells where at least this many features are detected.
+aml1.d <- CreateSeuratObject(counts = aml1.d.data, project = "AML1_D", min.cells = 5, min.features = 200)
+aml2.r <- CreateSeuratObject(counts = aml2.r.data, project = "AML2_R", min.cells = 5, min.features = 200)
+aml3.d <- CreateSeuratObject(counts = aml3.d.data, project = "AML3_D", min.cells = 5, min.features = 200)
+aml3.r <- CreateSeuratObject(counts = aml3.r.data, project = "AML3_R", min.cells = 5, min.features = 200)
+
+## remove intermediate objects and perform garbage collection
+
+rm(aml2.r.data)
+rm(aml3.d.data)
+rm(aml3.r.data)
+gc()
+
+## Number of cells
+cat( "\n",
+     "AML1_D: ", length(Cells(aml1.d)),"\n",
+     "AML2_R: ", length(Cells(aml2.r)),"\n",
+     "AML3_D: ", length(Cells(aml3.d)),"\n",
+     "AMl3_R: ", length(Cells(aml3.r)),"\n")
+```
+
+
+### MT Genes
+
+Non-viable cells tend to have high mitochondrial gene expression. In this sub-section we calculate percentage of mitochondrial gene expressed in each cell. This will help us to filter non-viable cells out from our data. It is good to check mitochondrial gene names in your data because it differs from organism/annotation. Three starting letter of mitochondrial genes can be `MT-`, `Mt-` or `mt-`.
+
+```{r mt-genes}
+## check MT genes
+all.genes <- rownames(aml1.d)
+all.genes[grep("^MT-", all.genes)]
+
+## calculate MT % for each samples separately
+aml1.d[["percent.mt"]] <- PercentageFeatureSet(aml1.d, pattern = "^MT-")
+aml2.r[["percent.mt"]] <- PercentageFeatureSet(aml2.r, pattern = "^MT-")
+aml3.d[["percent.mt"]] <- PercentageFeatureSet(aml3.d, pattern = "^MT-")
+aml3.r[["percent.mt"]] <- PercentageFeatureSet(aml3.r, pattern = "^MT-")
+
+```
+
+### QC Plots
+
+In single cell expression data, commonly used quality matrices are:
+
+* Number of total gene count per cell (`nFeature`).
+* Number of unique gene count (UMI or unique molecular identifier) per cell (`nCount`).
+* Percentage of mitochondrial expressed.
+
+In the following code block we all three matrices in violin plots.
+
+```{r QC-vln-plot}
+vp1 <- VlnPlot(aml1.d, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, cols = "#999999")
+vp2 <- VlnPlot(aml2.r, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, cols = "#E69F00")
+vp3 <- VlnPlot(aml3.d, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, cols = "#56B4E9")
+vp4 <- VlnPlot(aml3.r, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, cols = "#FF9999")
+
+vp1; vp2; vp3; vp4
+```
+
+In the following code block we visualize `nCount_RNA` versus `percent.mt` and `nCount_RNA` versus `nFeature_RNA`.
+
+```{r QC-scatter-plots}
+
+sc1 <- FeatureScatter(aml1.d, feature1 = "nCount_RNA", feature2 = "percent.mt", cols = "#999999") + 
+         FeatureScatter(aml1.d, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", cols = "#999999")
+
+sc2 <- FeatureScatter(aml2.r, feature1 = "nCount_RNA", feature2 = "percent.mt", cols = "#E69F00") + 
+         FeatureScatter(aml2.r, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", cols = "#E69F00")
+
+sc3 <- FeatureScatter(aml3.d, feature1 = "nCount_RNA", feature2 = "percent.mt", cols = "#56B4E9") + 
+         FeatureScatter(aml3.d, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", cols = "#56B4E9")
+
+sc4 <- FeatureScatter(aml3.r, feature1 = "nCount_RNA", feature2 = "percent.mt", cols = "#FF9999") + 
+           theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+       FeatureScatter(aml3.r, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", cols = "#FF9999") +
+           theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+
+
+sc1; sc2; sc3; sc4;
+```
+
+### QC plots using Ggplot
+
+Generating plots outside of Seurat package gives more flexibility and customization. However, to make custom plots, you should be able to find right data from  from a Seurat object's slot. Here we use `ggplots` to generate similar plots. In Seurat meta-data is stored in a slot `seuratObj@meta.data`. 
+
+```{r QC-ggplot}
+## Lets have a look into Seurat meta-data
+head(aml1.d@meta.data)
+
+## using ggplot
+ggplot(aml1.d@meta.data, aes(x=nCount_RNA, y=nFeature_RNA)) + 
+  geom_point(color="#FF9999")
+```
+
+### Top expressed genes
+
+It is often a good idea to check list of top expressed genes. Here we check only for samples `AML1_D`. 
+
+> First three lines of codes in the following code block is from NBIS Sweden.
+
+```{r top-exp-genes}
+C = aml1.d@assays$RNA@layers$counts
+rownames(C) <- rownames( aml1.d@assays$RNA )
+C@x = C@x/rep.int(colSums(C), diff(C@p))
+most_expressed <- order(Matrix::rowSums(C), decreasing = T)[20:1]
+
+a <- t(as.matrix(C[most_expressed, ]))
+dat <- stack(as.data.frame(a))
+colnames(dat) <- c("Percentage", "Gene")
+
+ggplot(dat) + 
+	geom_boxplot(aes(x = Gene, y = Percentage, color=Gene)) +
+	coord_flip() +
+	labs(y = "% total count per cell") +
+	theme(legend.position = "none")
+```
+## Exercise 1
+
+* Create a density plot of `nFeature_RNA` for the sample `AML1_D`.
+* Add vertical dotted lines (parallel to y-axis) showing filtering threshold.
+
+## Exercise 2
+
+* Create a object `temp` from `aml1.d`.
+* Calculate ribosomal gene percentage.
+* Generate a violinplot showing ribosomal gene percentage.
+* Filter `MALAT1` gene from the sample `AML1_D`.
+* Create a object `temp2` from `aml1.d`.
+* Filter Hemoglobin gene
+* Remove `temp` and `temp2` objects.
+
+Hints:  
+* Ribosomal genes pattern: ^RP[SL]
+* Hemoglobin genes pattern: ^HB[^(P)]
+* Count matrix is in the slot `aml1.d@assays$SCT@data`
+
+### Filtering
+
+Rationale behind filtering:
+* Low-quality/empty cells have very low gene count.
+* Doublets have very high gene count.
+
+
+#### Manual filtering
+Here we filter every sample separately.
+
+```{r filtering-sep-data}
+
+aml1.d.filt <- subset(aml1.d, subset = nFeature_RNA > 500 & nFeature_RNA < 3500 & percent.mt < 10)
+aml2.r.filt <- subset(aml2.r, subset = nFeature_RNA > 500 & nFeature_RNA < 3000 & percent.mt < 10)
+aml3.d.filt <- subset(aml3.d, subset = nFeature_RNA > 500 & nFeature_RNA < 2500 & percent.mt < 10)
+aml3.r.filt <- subset(aml3.r, subset = nFeature_RNA > 500 & nFeature_RNA < 3000 & percent.mt < 10)
+
+## 
+aml1.d.raw <- aml1.d
+
+## remove objects
+## aml1.d will be used in exercise 1
+#rm(aml1.d)
+rm(aml2.r)
+rm(aml3.d)
+rm(aml3.r)
+gc()
+
+## Plots of filtered data
+vp1 <- VlnPlot(aml1.d.filt, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, cols = "#999999")
+vp2 <- VlnPlot(aml2.r.filt, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, cols = "#E69F00")
+vp3 <- VlnPlot(aml3.d.filt, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, cols = "#56B4E9")
+vp4 <- VlnPlot(aml3.r.filt, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, cols = "#FF9999")
+
+vp1; vp2; vp3; vp4
+
+```
+
+#### Advance filtering
+
+This is an optional section. Thus, it is recommended to run if time permits.
+
+There are many methods for detecting doublets from single cell data. In the following code block we use *scDblFinder* R package for automatic doublet detection.
+
+Please refer to doublet detection tools from [https://doi.org/10.1016/j.cels.2020.11.008](https://doi.org/10.1016/j.cels.2020.11.008).
+
+```{r advanced-fitlering}
+suppressMessages(library(scDblFinder))
+
+temp.sce <- as.SingleCellExperiment(aml1.d, assay="RNA")
+
+## For 10x data, it is usually safe to leave the dbr empty, and it will be automatically estimated.
+temp.sce <- scDblFinder(temp.sce)
+
+plot.data <- as.data.frame(temp.sce@colData)
+
+
+ggplot(plot.data, aes(x=nCount_RNA, y=nFeature_RNA, col=scDblFinder.class)) + geom_point()
+
+
+## violin plot
+
+## Convert data into tidy format
+plot.data.tidy <- reshape2::melt(plot.data[,c("scDblFinder.class", "nFeature_RNA")])
+
+
+## violin plot
+p1 <- ggplot(plot.data.tidy , aes(x=variable, y=value)) +  
+  geom_jitter(alpha=0.6, aes(color=scDblFinder.class))+
+  geom_violin(alpha=0.0)
+
+p2 <- ggplot(plot.data, aes(x=nCount_RNA, y=nFeature_RNA, color=scDblFinder.class)) + 
+         geom_point() +
+         theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+p1+p2
+
+
+## remove doublets from Seurat obejct
+singlets <- rownames(plot.data[plot.data$scDblFinder.class=="singlet",])
+
+aml.d.sing <- subset(aml1.d, cells=singlets)
+
+## remove objects
+rm(temp.sce)
+rm(plot.data)
+rm(plot.data.tidy)
+rm(singlets)
+rm(aml.d.sing)
+```
+
+
+### Normalization
+
+Sequencing reaction happens in each cell independent of others cells. This creates differences in gene count distribution. To make gene expression distributions comparable, we have to normalize gene expression of each cell. 
+
+
+Lets normalize each samples separately first. Since non-aggregated data is not normalized by sequencing depth, it is recommended to use SCTransform normalization method to account for the sequencing depth bias. In the following code we have used `vars.to.regress` to regress-out effect coming from mitochondrial gene expression. Removal of unnecessary variation will be discussed in session 2.
+
+```{r SCTransform}
+
+aml1.d <- SCTransform(aml1.d.filt, vars.to.regress = "percent.mt", variable.features.n = 500, verbose = FALSE)
+aml2.r <- SCTransform(aml2.r.filt, vars.to.regress = "percent.mt", variable.features.n = 500, verbose = FALSE)
+aml3.d <- SCTransform(aml3.d.filt, vars.to.regress = "percent.mt", variable.features.n = 500, verbose = FALSE)
+aml3.r <- SCTransform(aml3.r.filt, vars.to.regress = "percent.mt", variable.features.n = 500, verbose = FALSE)
+
+## We rename "-1" part of the barcode
+## aml1.d : "-1" ( "-1" is already there. Thus, no need to do anything)
+## aml2.r : "-2"
+## aml3.d : "-3"
+## aml3.r " "-4"
+aml2.r <- RenameCells(aml2.r, new.names = gsub("\\-1", "\\-2", Cells(aml2.r)))
+aml3.d <- RenameCells(aml3.d, new.names = gsub("\\-1", "\\-3", Cells(aml3.d)))
+aml3.r <- RenameCells(aml3.r, new.names = gsub("\\-1", "\\-4", Cells(aml3.r)))
+
+## Combine the data and remove intermediate objects
+aml <- merge(aml1.d,  list(aml2.r, aml3.d, aml3.r))
+
+## check cell number per samples
+head(aml@meta.data)
+tail(aml@meta.data)
+## remove intermediate objects
+rm(aml1.d.filt)
+rm(aml2.r.filt)
+rm(aml3.d.filt)
+rm(aml3.r.filt)
+
+gc()
+```
+
+
+
+
+## Using aggregated count data
+
+The directory `data/sc-rnaseq/aggregate` contains combined (normalized by sequencing depth) count data. 
+
+Following is the directory structure generated using Cellranger `aggr` workflow. Count data (output from Cellranger `count`) from all the samples were used as inputs. In this course we use data from `filtered_gene_bc_matrices_mex` directory. The file `aggregation_csv.csv` contains samples being used in the analysis. In the aggregated data cell barcodes have running number `-1`, `-2` , `-3` and `-4` as a prefix. These running numbers are sample identifiers corresponding to the sample order in the file `aggregation_csv.csv`. 
+
+```
+user@node1 ~$ ll AGG/outs/
+total 1222028
+-rw-r----- 1 user cluster_users       551 Sep  7 11:19 aggregation_csv.csv
+drwxr-xr-x 6 user cluster_users      4096 Sep  7 11:58 analysis
+-rw-r--r-- 1 user cluster_users    305721 Sep  7 11:24 cell_barcodes.csv
+-rw-r--r-- 1 user cluster_users  83787816 Sep  7 11:58 cloupe.cloupe
+-rw-r--r-- 1 user cluster_users  26223481 Sep  7 11:45 filtered_gene_bc_matrices_h5.h5
+drwxr-xr-x 3 user cluster_users      4096 Sep  7 11:58 filtered_gene_bc_matrices_mex
+-rw-r--r-- 1 user cluster_users 340778181 Sep  7 11:46 filtered_molecules.h5
+-rw-r--r-- 1 user cluster_users  53403240 Sep  7 11:45 raw_gene_bc_matrices_h5.h5
+drwxr-xr-x 3 user cluster_users      4096 Sep  7 11:58 raw_gene_bc_matrices_mex
+-rw-r--r-- 1 user cluster_users 737110762 Sep  7 11:27 raw_molecules.h5
+-rw-r--r-- 1 user cluster_users      2788 Sep  7 11:56 summary.json
+-rw-r--r-- 1 user cluster_users   4774649 Sep  7 11:56 web_summary.html
+```
+### Data format
+
+The aggregate data format is similar to the coutn data format containing the following files. The aggrete data contains data from two or moe samples.
+
+* barcodes.tsv.gz
+* features.tsv.gz
+* matrix.mtx.gz
+
+> NOTE: Following is a bash code.
+
+```{bash}
+DATA_DIR="data/sc-rnaseq/aggregate"
+
+zcat $DATA_DIR/barcodes.tsv.gz | head
+
+zcat $DATA_DIR/barcodes.tsv.gz | tail
+```
+
+
+> NOTE: Following is a bash code.
+
+```{bash}
+DATA_DIR="data/sc-rnaseq/aggregate"
+
+zcat $DATA_DIR/features.tsv.gz | head
+
+```
+
+```{bash}
+DATA_DIR="data/sc-rnaseq/aggregate"
+
+zcat $DATA_DIR/matrix.mtx.gz | head
+```
+
+Now, we import the aggregate count data in the following code block.
+
+```{r agg-data-loading}
+
+## load aggregate data [readily sequencing depth normalized]
+aml <- Read10X(data.dir = file.path(data.dir, "aggregate"))
+aml.all <- CreateSeuratObject(counts=aml, names.delim = "-", names.field = 2)
+
+## get current identities
+levels(aml.all)
+table( Idents(aml.all) )
+
+## set new identities
+aml.all <- RenameIdents(aml.all, '1' = "AML2_R", "2" = "AML1_D", "3"="AML3_D", "4"="AML3_R")
+table( Idents(aml.all) )
+
+## add 'sample' column to aml@meta.data dataframe
+aml.all <- AddMetaData(aml.all, Idents(aml.all), col.name = "sample")
+
+## number of cells
+table(aml.all@meta.data$sample)
+
+
+```
+
+
+> **Question:** Find out why we have used the arguments`names.delim` and `names.field` in the function `CreateSeuratObject`.
+
+
+### MT genes
+
+With the aggregate data, we can calculate mitochondrial gene percentage using just one-liner syntax.
+
+```{r mt-genes-aggr}
+aml.all[["percent.mt"]] <- PercentageFeatureSet(aml.all, pattern = "^MT-")
+```
+
+### QC plots
+
+In the following code block QC plots contain all the samples. Thus, with aggregated data it is easier to create plots with fewer line of code.
+
+```{r QC-vln-plot-aggr}
+vp5 <- VlnPlot(aml.all, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+vp5
+
+
+sc5 <- FeatureScatter(aml.all, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+           theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+       FeatureScatter(aml.all, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+           theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+sc5
+
+```
+### Filtering
+
+When it comes to aggregated data, we have to use different filtering threshold for each sample. Thus, The filtering on aggregated data results splitting of the data. We have to merge the splits afterwards.
+
+```{r filtering-agg-data}
+## Filter
+temp1 <- subset(aml.all, subset = nFeature_RNA > 500 & nFeature_RNA < 3500 & percent.mt < 10 & sample=="AML1_D")
+temp2 <- subset(aml.all, subset = nFeature_RNA > 500 & nFeature_RNA < 3000 & percent.mt < 10 & sample=="AML2_R")
+temp3 <- subset(aml.all, subset = nFeature_RNA > 500 & nFeature_RNA < 2500 & percent.mt < 10 & sample=="AML3_D")
+temp4 <- subset(aml.all, subset = nFeature_RNA > 500 & nFeature_RNA < 3000 & percent.mt < 10 & sample=="AML3_R")
+
+## create a new aggregated data object
+aml.filt <- merge(temp1,  list(temp2, temp3, temp4))
+
+
+## plot
+VlnPlot(aml.filt, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+
+
+## ggplot filtering plots
+nfeat.tidy <- reshape2::melt(aml.all@meta.data[,c("nFeature_RNA","sample")], measure.vars=c("nFeature_RNA")) 
+
+ggplot(nfeat.tidy, aes(x=value, fill=sample, colour=sample) ) +
+  geom_density(alpha = 0.1) 
+
+
+## plot with filtering threshold
+ggplot(nfeat.tidy[nfeat.tidy$sample=="AML3_R",], aes(x=value, fill=sample, colour=sample) ) +
+  geom_density(alpha = 0.1) +
+  geom_vline(xintercept = 500, linetype=2) +
+  geom_vline(xintercept = 3000, linetype=2)
+
+## remove temp objects and run garbage collector
+rm(temp1)
+rm(temp2)
+rm(temp3)
+rm(temp4)
+gc()
+
+```
+### Normalization
+
+For aggregated data is it not essential to use SCTransform normalization because aggregated data is sequencing depth normalized data. Thus, we normalize the raw count data using Seurat's default method `LogNormalize`. LogNormalize divides count of a cell by its total count and multiplies by `scale.factor` (default: 10000). The result is then log transferred using `log1p` which computes natural logarithm of the given value plus one. This is done to avoid getting `-Inf` values while using `log`.
+
+
+```{r normalization, message=FALSE}
+aml.filt <- NormalizeData(aml.filt)
+```
+
+
+## Exercise 3
+
+* Add sex column to `aml.filt@metadata` data-frame and populate respective sex for each sample. Check sex of corresponding samples from section *Data*.
+Hints:
+* Check function `AddMetaData`
+
+
+
+Finally, we have completed the data loading, QC and the normalization step. In the following code block we save the final object `aml` into a file.
+
+```{r save-final-object}
+aml <- JoinLayers(aml.filt)
+
+saveRDS(aml, file = file.path(robj.dir,"aml.RDS"))
+
+rm(list = ls())
+gc()
+```
+
+After saving the object, clear the environment variable by pressing 🧹 ("Environment"  tab on the top right).
+
+
+<!-- ░██████╗███████╗░██████╗░██████╗██╗░█████╗░███╗░░██╗  ██████╗░ -->
+<!-- ██╔════╝██╔════╝██╔════╝██╔════╝██║██╔══██╗████╗░██║  ╚════██╗ -->
+<!-- ╚█████╗░█████╗░░╚█████╗░╚█████╗░██║██║░░██║██╔██╗██║  ░░███╔═╝ -->
+<!-- ░╚═══██╗██╔══╝░░░╚═══██╗░╚═══██╗██║██║░░██║██║╚████║  ██╔══╝░░ -->
+<!-- ██████╔╝███████╗██████╔╝██████╔╝██║╚█████╔╝██║░╚███║  ███████╗ -->
+<!-- ╚═════╝░╚══════╝╚═════╝░╚═════╝░╚═╝░╚════╝░╚═╝░░╚══╝  ╚══════╝ -->
+
+# Feature Selection, Removal of Undesired Sources of Variation, and Dimensionality Reduction
+
+In this section, we will focus on feature selection, removal of undesired sources of variation and dimensionality reduction. Before processing we have to load the object saved in the previous section.
+
+Participants are expected to watch lecture videos of the following modules from [https://uppsala.instructure.com/courses/52011/modules](https://uppsala.instructure.com/courses/52011/modules).
+
+- Dimensionality Reduction
+- Data Integration
+
+## Identifying Highly Variable Genes
+
+Highly variable genes (HVGs) are genes that show the most variation across cells (i.e., they are highly expressed in some cells and lowly expressed in others). There are two main reasons to identify highly variable genes (HVGs):
+
+- To reduce the dimensionality of the data (curse of dimensionality) and
+- To identify genes that are driving the biological variation in the data.
+
+```{r highly-variable-genes, message=FALSE, warning=FALSE}
+suppressMessages(library(Seurat))
+suppressMessages(library(gridExtra))
+suppressMessages(library(ggplot2))
+suppressMessages(library(glmGamPoi))
+
+
+## Load the saved object from previous session
+aml <- readRDS("results/sc-rnaseq/robj/aml.RDS")
+
+## calculate variable features
+aml <- FindVariableFeatures(aml, nfeatures=2000, verbose = FALSE)
+
+
+## Get top 10 most highly variable genes
+top10 <- head(VariableFeatures(aml), 10)
+top10
+
+## Plot HVGs with labels
+hvg <- VariableFeaturePlot(aml) + labs(title = 'HVGs')
+hvg.labelled <- LabelPoints(plot = hvg, points = top10, repel = TRUE) + labs(title = 'HVGs, top10 HVGs labeled')
+
+hvg.labelled
+
+```
+
+## Removal of undesired sources of variation (1/2)
+Removing unwanted sources of variation helps find the biological sources of variation we are actually interested in. Here, we will regressing-out mitochondrial RNA content and cell cycle effects, which are common sources of variation in single-cell RNA-seq data. For the sake of this tutorial, we will regressing-out only the mitochondrial RNA content, and then perform dimensionality reduction and visualization.
+
+Furthermore, we will regress-out cell cycle effects and perform dimensionality reduction and visualization again to see how it affects the data.
+
+In practice, it makes sense to go back to this step also after clustering and visualization, as the clustering results can help identify unwanted sources of variation that were not apparent before, or reveal that some sources of variation that were removed were actually biologically relevant.
+
+```{r mt-regress-out}
+## Save the object before regressing out confounders
+aml.before.regression <- aml
+
+## Regress out mitochondrial content and scale data
+aml.mtregressed <- ScaleData(aml.before.regression, vars.to.regress = "percent.mt", verbose = FALSE)
+
+```
+
+
+## Dimensionality Reduction
+Humans are usually not good at grasping contexts, especially in more than three dimensions. Dimensionality reduction techniques help us visualize the data in 2D or 3D, while retaining most of the variation in the data.
+
+
+### Principal Component Analysis (PCA)
+
+PCA is the most common dimensionality reduction technique. It helps in visualizing the data and identifying clusters, and the resulting principal components (expressing most of the variation in our dataset) can be used in downstream analyses, such as embedding the data in lower dimensions in UMAP or t-SNE.
+
+
+```{r}
+## perform PCA
+aml.mtregressed <- RunPCA(aml.mtregressed,
+                          features = VariableFeatures(object = aml.mtregressed),
+                          ndims.print = 1:3,
+                          nfeatures.print = 5)
+
+
+## Visualize top genes associated with the first 2 PCA components
+VizDimLoadings(aml.mtregressed,
+                          dims = 1:3,
+                          reduction = "pca",
+                          ncol = 3)
+
+
+## Plot dimensionality reduction on two dimensions as a scatter plot
+DimPlot(aml.mtregressed, reduction = "pca") + 
+  labs(title = 'PCA')
+
+# Plot heatmaps for top genes and cells associated with the first two principal components
+DimHeatmap(aml.mtregressed,
+                      dims = 1:6,
+                      cells = 500,
+                      balanced = TRUE,
+                      fast = FALSE)
+
+## Elbow plot
+ElbowPlot(aml.mtregressed, ndims = 50)
+```
+
+## Exercise 4
+
+Compare PCA results before and after regressing out mitochondrial RNA.
+
+1. Without regressing-out mitochondrial RNA:
+- Copy the object `aml.before.regression` to `temp`.
+- Run `ScaleData()` on the `temp` and save it in another object `temp.scaled.wo.mt` object without regressing out `percent.mt`.
+- Run PCA on `temp.scaled.wo.mt` and show 20 top genes (using `nfeatures.print`) from first 3 PCs (using `ndims.print`).
+- Visualize PCA plot.
+
+2. By regressing-out mitochondrial RNA:
+
+- Copy the object `aml.before.regression` to `temp`.
+- Run `ScaleData()` on the `temp` and save it in another object `temp.scaled.mt` object by regressing out mitochondrial RNA.
+- Run PCA on `temp.scaled.mt` and show 20 top genes (using `nfeatures.print`) from first 3 PCs (using `ndims.print`).
+- Visualize PCA plot.
+
+
+How do the results differ before and after regressing out mitochondrial RNA?
+
+3. Customize the PCA plot generated from `temp.scaled.mt`.
+- Regenerate the PCA plot. In the plot split the cells by `sample`, set the cell size to `2`, and set transparency (alpha) to 40%.
+- Produce yet another PCA plot. Highlight cells with `percent.mt > 9`.
+
+> Visit the following website to get a better feeling for PCA: https://setosa.io/ev/principal-component-analysis/
+
+
+## Removal of undesired sources of variation (2/2)
+
+Cell cycle is a major source of variation in single-cell RNA-seq data. Correcting for cell cycle effects helps in identifying the biological sources of variation we are interested in.
+
+
+```{r cell-cycle-genes}
+# Load cell cycle genes
+cc.genes <- Seurat::cc.genes.updated.2019
+
+cat("S-Phase genes:\n", paste(cc.genes$s.genes, sep=""), "\n\n")
+cat("G2M-Phase genes:\n", paste(cc.genes$g2m.genes, sep=""), "\n")
+
+```
+
+Lets perform the cell cycle scoring in the original `aml` object for later use.
+
+```{r cell-cycle-scoring}
+# Score cell cycle phase
+aml <- CellCycleScoring(aml,
+                        s.features = cc.genes$s.genes,
+                        g2m.features = cc.genes$g2m.genes,
+                        set.ident = TRUE,
+                        layer = "data")
+
+# Visualize the distribution of a few of the cell cycle markers, top row being S phase and bottom row being G2M phase genes
+RidgePlot(aml, features = c("NUSAP1", "PCNA"), ncol = 2)
+```
+
+Plot (using signal only from the cell cycle genes) PCA before regressing-out cell cycle effects.
+
+```{r}
+## copy the object
+aml.before.cc.regression <- aml
+
+## Scale data without regressing-out cell cycle genes
+aml.before.cc.regression <- ScaleData(aml.before.cc.regression,
+                                       features = VariableFeatures(aml.before.cc.regression),
+                                       layer = "data"
+)
+
+## Run PCA on cell cycle genes only to see if cells separate by cell cycle phase
+aml.before.cc.regression <- RunPCA(aml.before.cc.regression,
+                                    features = c(cc.genes$s.genes, cc.genes$g2m.genes) )
+
+# Visualize PCA results
+DimPlot(aml.before.cc.regression,
+        reduction = "pca",
+        group.by = "Phase")
+
+
+## remove object
+rm(aml.before.cc.regression)
+gc()
+
+```
+
+Plot PCA after regressing-out cell cycle effects.
+
+```{r}
+aml.after.cc.regression <- aml
+
+## Scale data by regressing out cell cycle signal
+aml.after.cc.regression <- ScaleData(aml.after.cc.regression,
+                                     features = VariableFeatures(aml.after.cc.regression),
+                                     layer = "data",
+                                     vars.to.regress = c("S.Score", "G2M.Score"),
+                                     verbose = FALSE)
+
+## Run PCA on cell cycle genes only to see if cells separate by cell cycle phase
+aml.after.cc.regression <- RunPCA(aml.after.cc.regression,
+                                    features = c(cc.genes$s.genes, cc.genes$g2m.genes) )
+
+## Visualize PCA
+DimPlot(aml.after.cc.regression,
+        reduction = "pca",
+        group.by = "Phase",
+        alpha = 0.3)
+
+
+## remove object
+rm(aml.after.cc.regression)
+gc()
+```
+
+## Exercise 5
+
+In some cases, regressing out all variation associated with cell cycle can be detrimental for downstream analyses, particularly in differentiating processes (like murine hematopoiesis), where differentiated cells are proliferating (or vice versa). In such cases, regressing out all cell cycle effects can blur the distinction between stem and progenitor cells as well. Thus, here we are only regressing out the difference between the S and G2M phase scores (S-Score - G2M-Score), so that signals separating non-cycling cells and cycling cells will be maintained, but differences in cell cycle phase among proliferating cells (which are often uninteresting), will be regressed out.
+
+Make a copy of the object `aml` and store it as `temp`, then perform the following on that object:
+
+- Calculate the difference between S and G2M scores. Hint: they are stored in the columns S.Score and G2M.Score of the object.
+- Regress out the difference between S and G2M scores using the `vars.to.regress` parameter in `ScaleData()`.
+- Run PCA on the regressed object and visualize the results. How do the results differ from regressing out all cell cycle effects?
+
+
+## Regress out confounders all together
+
+Why? If you regress out confounders one at a time in separate ScaleData calls, the residuals from each step become the input for the next, meaning you are regressing against an already transformed dataset. This can lead to unintended interactions between regressors and less interpretable results. Similarly, if factors are regressed out sequentially, each round of regression could introduce artifacts or distortions in the variance structure of the data, particularly if the factors are correlated. Thus, it is recommended to regress out all confounders together.
+
+Here, we found both mitochondrial RNA content and cell cycle effects to be confounders. We will regress them out together and visualize the results.
+
+```{r regress-out-all}
+## Scale data by regressing-out percent.mt, S.Score and G2M.Score
+aml <- ScaleData(aml,
+                 vars.to.regress = c("percent.mt", "S.Score", "G2M.Score"),
+                 layer = "data",
+                 verbose = FALSE)
+
+
+## Run PCA
+aml <- RunPCA(aml,
+              features = VariableFeatures(aml),
+              ndims.print = 1:3,
+              nfeatures.print = 20)
+
+
+## Visualize PCA results
+DimPlot(aml,
+        reduction = "pca",
+        group.by = "Phase") + 
+  ggtitle("PCA After Regression, Grouped by Phase")
+
+
+## Visualize top genes associated with the first 2 PCA components
+VizDimLoadings(aml,
+               dims = 1:2,
+               reduction = "pca") + 
+  ggtitle("Top Genes PCA Loadings After Regression")
+
+```
+
+
+## Data Integration / Batch Correction
+
+### Sample Integration
+
+This step is optional and should only be performed when you suspect large differences between samples (e.g., different batches, different sequencing runs, etc.), or when you want to integrate multiple datasets from different sources (e.g. different chemistry, facilities, etc.). In this case, our data was generated using the same chemistry and facility, and the samples look fairly mixed in the PCA and embeddings, so we will not perform integration here, but we will show you how it works, and you can try how it affects the PCA and clustering results, if time permits. There are many methods available for data integration, such as CCA, MNN, Harmony, scVI, Limma, Liger, and many more. Here, we will use the `FindIntegrationAnchors` and `IntegrateData` functions in Seurat, which represents an anchor-based (RPCA-based) integration method.
+
+```{r}
+options(future.globals.maxSize = 2 * 1024^3)
+
+temp <- aml
+
+## Split the object by sample
+temp.list <- SplitObject(temp, split.by = "sample")
+
+## Identify variable features for each dataset independently, selecting the top 10% most variable genes as highly variable genes
+temp.list <- lapply(X = temp.list, FUN = function(x) {
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 0.1 * nrow(x[["RNA"]]), layer = "data")
+})
+
+
+##  Select genes that are useful for comparing datasets.
+## * Seurat examines the variable features in each dataset.
+## * It prioritizes genes that are variable across datasets.
+## * It returns a list of 2,000 genes to use for integration.
+anchor.features <- SelectIntegrationFeatures(object.list = temp.list)
+
+
+
+temp.list <- lapply(X = temp.list, FUN = function(x) {
+  x <- ScaleData(x, features = anchor.features, verbose = FALSE)
+  x <- RunPCA(x, features = anchor.features, verbose = FALSE)
+})
+
+## Find pairs of cells that appear biologically similar across datasets.
+temp.anchors <- FindIntegrationAnchors(object.list = temp.list, 
+                                       anchor.features = anchor.features, 
+                                       reduction = "rpca",
+                                       verbose = FALSE)
+
+## Use the anchors to correct differences between datasets.
+temp.combined <- IntegrateData(anchorset = temp.anchors, verbose = FALSE)
+
+# The integrated data is stored in a separate assay named 'integrated'
+print(temp.combined@assays)
+
+
+print(colnames(temp.combined[[]]))
+```
+
+Now, our integrated data is stored in the integrated assay. As you can see, this assay does not contain a data or counts layer anymore, which means that our data is now represented in the latent space, and we don’t have access to a count matrix anymore. The latent space is a lower-dimensional representation of the data that captures shared structure across cells, where items resembling each other are closer together and items that are dissimilar are further apart. You can think of it as being similar to the PCA space, but it is learned from the data and is not directly interpretable. That’s why once the data is transformed into the integrated latent space, we don’t have actual count data anymore, and we can’t perform operations like differential expression analysis or other operations that require count data on this space. Yet, the latent space can be used as direct input for UMAP and t-SNE, and can improve clustering results thanks to the removal of batch effects.
+
+## Dimensionality Reduction (continued)
+
+### UMAP and t-SNE
+
+UMAP (Uniform Manifold Approximation and Projection) and t-SNE (t-distributed Stochastic Neighbor Embedding) are non-linear dimensionality reduction techniques that help visualize the data by creating lower-dimensional representations of the data in 2D or 3D. They are particularly useful for visualizing clusters in single-cell RNA-seq data, as they can capture similarities and variation between cells visually.
+
+To determine the dimensionality of the data, we will first plot an Elbow plot. We are trying to find the number of principal components that capture most of the variation in the data, forming the characteristic ‘elbow’ shape in the plot.
+
+```{r tsne-umap}
+ElbowPlot(aml)
+
+## Run UMAP and t-SNE
+aml <- RunUMAP(aml, dims = 1:30, verbose = FALSE)
+aml <- RunTSNE(aml, dims = 1:30, verbose=FALSE)
+
+## Plot results
+DimPlot(aml, reduction = "umap", group.by = "Phase") + 
+  ggtitle("UMAP")
+
+DimPlot(aml, reduction = "tsne", group.by = "Phase") + ggtitle("t-SNE")
+
+## Save the object
+saveRDS(aml, file = file.path("results/sc-rnaseq/robj/aml.session2.RDS"))
+
+## clear env
+rm(list = ls())
+gc()
+
+```
+
+## Exercise 6
+
+Create an object `temp` from the `aml` object and perform the following:
+
+- Rerun PCA on the object `temp` using the 500 HGVs as features.
+- Try changing the `dims` parameter to `1:20` in `RunUMAP`. How does it affect clustering? You can try grouping by `sample` or `Phase` in `DimPlot`.
+- You can also embed continuous variables in the UMAP or t-SNE plots using the `FeaturePlot()` function. Try embedding the `percent.mt` and `nFeature_RNA` variables in UMAP plots.
+
+
+If you have time, visit the following websites to further explore the different dimensionality reduction techniques, and how t-SNE's and UMAP's hyperparameters affect the clustering:
+
+PCA: https://setosa.io/ev/principal-component-analysis/
+
+t-SNE: https://distill.pub/2016/misread-tsne/
+
+UMAP: https://pair-code.github.io/understanding-umap/
+
+
+
+<!-- ░██████╗███████╗░██████╗░██████╗██╗░█████╗░███╗░░██╗  ██████╗░
+     ██╔════╝██╔════╝██╔════╝██╔════╝██║██╔══██╗████╗░██║  ╚════██╗
+     ╚█████╗░█████╗░░╚█████╗░╚█████╗░██║██║░░██║██╔██╗██║  ░█████╔╝
+     ░╚═══██╗██╔══╝░░░╚═══██╗░╚═══██╗██║██║░░██║██║╚████║  ░╚═══██╗
+     ██████╔╝███████╗██████╔╝██████╔╝██║╚█████╔╝██║░╚███║  ██████╔╝
+     ╚═════╝░╚══════╝╚═════╝░╚═════╝░╚═╝░╚════╝░╚═╝░░╚══╝  ╚═════╝░ -->
+
+# Clustering, differential gene expression analysis and functional analysis
+
+Lets load the required libraries and RDS file from the previous section.
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+suppressMessages(library(Seurat))
+suppressMessages(library(dplyr))
+suppressMessages(library(ggplot2))
+suppressMessages(library(Seurat))
+suppressMessages(library(enrichplot))
+suppressMessages(library(pheatmap))
+suppressMessages(library(viridis))
+suppressMessages(library(scCustomize))
+suppressMessages(library(ggalluvial))
+suppressMessages(library(progeny))
+
+## Load the saved object from previous session
+
+## From google drive
+# download.file("https://drive.google.com/uc?export=download&id=1wruq816oUFXUnMPn0SXIvSqDKejBegvh",  destfile = "aml.session2.RDS", mode = "wb")
+# aml <- readRDS("aml.session2.RDS")
+
+
+aml <- readRDS("/home/rstudio/abptds/results/sc-rnaseq/robj/aml.session2.RDS")
+
+```
+
+## Clustering
+Seurat applies a graph-based clustering approach. First, a KNN graph is constructed based on the euclidean distance in PCA space. For clustering, we apply the Louvain algorithm (`algorithm = 1`) which is the default modularity optimization method in Seurat. With the resolution parameter, it is possible to define the number of clusters.
+
+
+Found clusters are visualized in UMAP visualization. Note that distance between clusters on the UMAP does not represent degree of similarity between clusters in the original data space. UMAP is a dimensionality reduction technique that prioritizes local structure preservation, meaning that while nearby points are generally more similar, global distances may not always be reliable for interpreting relationships between clusters.
+
+```{r clustering}
+## Find-k-nearest neighor
+aml <- FindNeighbors(aml, dims = 1:30, reduction = "pca")
+
+## Find clusters
+aml <- FindClusters(aml, resolution = 0.5)
+
+## UMAP 
+DimPlot(aml, reduction = "umap", label= TRUE)
+
+## can be visualized as PCA as well
+DimPlot(aml,reduction="pca")
+```
+
+Let's inspect the Seurat object.
+
+```{r}
+head(aml@meta.data)
+
+## get clusters
+unique(aml@meta.data$seurat_clusters)
+
+## using idents
+unique(Idents(aml))
+
+table(aml@meta.data$seurat_clusters)
+
+```
+
+
+Let's visualize the sample specificity of the clusters using a heatmap.
+
+```{r}
+## get cell numbers from each sample for seach cluster
+df <- as.data.frame.matrix(table(aml$sample, aml$seurat_clusters))
+
+## transpose
+df <- t(df)
+
+## convert to percentage
+df <- df/rowSums(df)
+
+## heatmap
+pheatmap(t(df), display_numbers = TRUE)
+
+```
+
+An aluvial plot can also be useful when we want to visualizing sample specific cells assigned to the clusters.
+
+```{r aluvial-plot}
+## aluvial plot
+plot.data <- aml@meta.data[,c("sample","seurat_clusters")]
+colnames(plot.data) <- c("Samples", "Clusters")
+
+## frequency per cluster
+freq <- plot.data %>% 
+  group_by(Samples,Clusters) %>% 
+  summarize(count=n())
+
+
+ggplot(as.data.frame(freq),
+              aes(y = count, axis1 = Samples, axis2 = Clusters)) +
+  geom_alluvium(aes(fill = Clusters), width = 1/12) +
+  geom_stratum(width = 1/12, fill = "black", color = "grey") +
+  geom_label(stat = "stratum", aes(label = after_stat(stratum))) +
+  scale_x_discrete(limits = c("Slides", "Clusters"), expand = c(.05, .05)) 
+```
+We can use non numeric `aml@meta.data` columns to color a UMAP plot.
+
+```{r}
+## color by sample
+DimPlot(aml, reduction = "umap", group.by = "sample")
+
+## color by Phase
+DimPlot(aml, reduction = "umap", group.by = "Phase")
+```
+
+
+### Exercise 7
+
+Add metadata coumn `sex` in `aml` object, re-generate an UMP plot, and color the plot by `sex`.
+
+### Exercise 8
+
+Re-generate UMP plots, and color the plots by `nCount_RNA`, `nFeature_RNA`, and `percent.mt`. Hint: `FetchData()`
+
+### Exercise 9
+
+Regenerate a UMAP plot. Highlighting cells with `percent.mt > 9`.
+
+### Exercise 10
+
+Make a copy of `aml` by assigning to `temp`. Regenerate UMAP plots using resolution parameter `0.6`, `0.7`, `0.8` and `0.9`. Use a for loop. What did you observe? Look into metadata of the object `temp` as well.
+
+## Differential Gene Expression (DGE) Analysis
+
+
+Let's look for differentially expressed genes between the clusters. We use `FindMarkers` function that applies Wilcoxon Rank Sum test by default (`test.use = "wilcox"`) for differential testing. Differential testing is applied for normalized data which is found from `aml@assays$RNA$data`. 
+
+Useful arguments in `FindMarkers` function are `min.pct` and `logfc.threshold`. By `min.pct`, you only test genes that are detected in a minimum fraction of `min.pct` cells in either of the two populations. By `logfc.threshold`, you can limit testing to genes which show, on average, at least X-fold difference (log-scale) between the two groups of cells. Default is 0.1 and the threshold speeds up the function, but can miss weaker signals.
+
+First, we aim to identify all marker genes for cluster 0.
+
+```{r dge-c8}
+# one cluster versus all other
+cluster0.markers <- FindMarkers(aml, ident.1 = 0, min.pct = 0.1, logfc.threshold = 0.1)
+head(cluster0.markers)
+```
+
+FindMarkers function produces a data.frame with a ranked list of markers as rows and associated statistics as columns. It includes following columns: 
+
+- `avg_logFC`: log fold-chage of the average expression between the two groups. Positive values indicate that the gene is more highly expressed in the first group.
+- `pct.1`: The percentage of cells where the gene is detected in the first group.
+- `pct.2`: The percentage of cells where the gene is detected in the second group.
+- `p_val_adj`: Adjusted p-value based on bonferroni correction using all genes in the dataset.
+
+
+Let's visualize the top DE genes for cluster 0 in a heatmap.
+
+```{r top-markers-heatmap-1, warning=FALSE}
+## get top 50 markers
+top50 <- cluster0.markers %>%
+  tibble::rownames_to_column(var="gene") %>%
+  top_n(n = 50, wt = avg_log2FC)
+
+## plot
+DoHeatmap(aml, features = top50$gene, size =3) + theme(text = element_text(size = 8)) + NoLegend()
+```
+
+We can also visualize the expression of top DE genes in violin and UMAP plots.
+
+```{r top-DE-genes-visualization-1}
+FeaturePlot(aml, features = c("IGLL1", "ITM2A", "TRH"))
+VlnPlot(aml, features = c("IGLL1", "ITM2A", "TRH"), pt.size=0.1)
+```
+
+
+Next, we want to find markers for every cluster compared to all remaining cells. Here we check top 5 markers for every cluster based on log2FC.
+
+```{r all-markers, warning=FALSE, message=FALSE}
+all.markers <- FindAllMarkers(aml, min.pct = 0.1, logfc.threshold = 0.1)
+
+
+all.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 5, order_by = avg_log2FC)
+```
+
+Here, we generate a heatmap showing the expression of the top 10 markers for each cluster.
+
+```{r top-markers-heatmap-2, warning=FALSE, message=FALSE}
+all.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> top10
+
+DoHeatmap(aml, features = top10$gene, size = 3) + theme(text = element_text(size = 3)) + NoLegend() 
+```
+
+We can again visualize some markers. Let's take the top markers of the biggest cluster 0.
+
+```{r top-DE-genes-visualization-2}
+FeaturePlot(aml, features = c("IGLL1", "ITM2A", "TRH"))
+VlnPlot(aml, features = c("IGLL1", "ITM2A", "TRH"), pt.size=0.1)
+```
+
+
+Based on the violin plot, we observe that the top markers for cluster 0 are also expressed in clusters 10 and 12, which are closely located on the UMAP. This suggests that the current clustering resolution may be too high, and these clusters could represent a single cell type. For the purpose of initial cell type annotation, we will retain the current resolution, although it is good to note that cell type annotation can be an iterative process, wherein optimal resolution is identified by refining the clustering and analyzing the biological relevance of the resulting groups 
+
+For the visualization of marker expression, we can alternatively use a ridge plot. 
+
+```{r top-DE-genes-alternative-visualization, fig.width=9, fig.height=5}
+RidgePlot(aml, features = c("IGLL1", "ITM2A", "TRH"), ncol =3)
+```
+
+
+If you wish more customization and visualization options for your single-cell RNA-seq analysis, there is the `scCustomize` package designed particularly for the output generated by Seurat (https://samuel-marsh.github.io/scCustomize/articles/Gene_Expression_Plotting.html). 
+
+We can for example use custom color palettes which distinguish low expressing cells from non-expressing cells (non-expressing cells are part of same color scale in FeaturePlot function).
+
+```{r sccustom-feature}
+FeaturePlot_scCustom(aml, features = "TRH")
+
+pal <- viridis(n = 10, option = "D")
+FeaturePlot_scCustom(aml, features = "TRH", colors_use = pal)
+
+```
+
+
+We can also more easily visualize a marker expression in each sample separately.
+
+
+```{r sccustom-density, fig.width=11, fig.height=8}
+FeaturePlot_scCustom(aml, features = "CRYGD", split.by = "sample", num_columns = 2)
+```
+
+### Comparing two clusters
+
+Sometimes, we are only interested in differences between specific clusters. To compare two clusters of interest, we use the `FindMarkers` function, specifying the cluster names in `ident.1` and `ident.2`. In this case, we compare clusters 2 and 4.
+
+```{r dge-2}
+# cluster2 versus cluster4
+levels(aml)
+c2.vs.c4.markers <- FindMarkers(aml, ident.1 = 2, ident.2 = 4, min.pct = 0.1, logfc.threshold = 0.1)
+
+# first few lines of the result
+head(c2.vs.c4.markers)
+```
+
+We want to plot only cells in these two clusters.
+
+```{r subset-plotting}
+# subsetting cells having identity 2 or 4
+c2.c4.cells <- WhichCells(aml, idents=c("2", "4"))
+
+# UMAP plot of cluster 9 and 10
+UMAPPlot(aml, cells=c2.c4.cells, label.size=6, pt.size = 1)
+```
+
+
+Genes with a positive logFC are overexpressed in cluster 2, while those with a negative logFC are overexpressed in cluster 4. Here, we examine two of these differentially expressed genes.
+
+```{r top-DE-genes-visualization-3, fig.width=10, fig.height=4}
+FeaturePlot_scCustom(aml, cells = c2.c4.cells, features = c("S100A9", "S100A8"))
+```
+
+
+### DGE between two sample groups
+
+Next, we aim to determine whether we can identify differences in gene expression between disease stages by performing differential gene expression (DGE) analysis between diagnostic and refractory samples. To begin, we will create a new column in `meta.data` and set it as the identity class.
+
+```{r DE-genes-2-samples}
+aml@meta.data$stage[aml@meta.data$sample %in% c("AML1_D", "AML3_D")] <- "diagnosis"
+aml@meta.data$stage[aml@meta.data$sample %in% c("AML2_R", "AML3_R")] <- "refractory"
+Idents(aml) <- "stage"
+levels(aml)
+
+DimPlot(aml, reduction = "umap")
+
+D.vs.R.markers <- FindMarkers(aml, ident.1 = "diagnosis",ident.2 = "refractory", min.pct = 0.1, logfc.threshold = 0.1)
+
+head(D.vs.R.markers)
+```
+We again visualize the expression of a few marker genes. The results suggest that it is possible to identify genes that are specifically associated with either the diagnostic or refractory stage.
+
+```{r top-DE-genes-visualization-4}
+FeaturePlot_scCustom(aml,features = c("IGLL1","HERPUD1"), order = F)
+VlnPlot(aml, features = c("IGLL1","HERPUD1"), pt.size=0.1)
+```
+
+### Exercise 11
+
+1. Using existing object `all.markers`, find number of up/down-regulated genes in clusters 2 & 3? How many up/down-regulated genes are shared between these clusters? 
+
+2. Identify key marker genes for each cluster. For both clusters, determine the gene with the highest `avg_log2FC` that is expressed in at least 50% of the cells within the cluster. Visualize the expression of these two genes using UMAP and violin plots.
+
+3. Create `temp` object from `aml`. Incorporate patient sex information into the `temp@meta.data` data frame. Perform differential gene expression analysis between male and female samples. Visualize the top marker genes using UMAP and violin plots. 
+
+
+## Functional analysis
+
+
+### Gene Ontology GO over-representation analysis (ORA)
+
+We perform over-representation analysis with ClusterProfiler. Over-representation analysis is a statistical method used to determine whether genes from predefined sets are present more frequently than expected in a given subset of the data. In this context, the subset refers to the set of upregulated or downregulated genes.
+
+Tutorial for Over-representation analysis with ClusterProfiler: [https://yulab-smu.top/biomedical-knowledge-mining-book/clusterprofiler-go.html](https://yulab-smu.top/biomedical-knowledge-mining-book/clusterprofiler-go.html)
+
+Here we define the annotation data set.
+
+```{r annotation}
+suppressMessages(library(clusterProfiler))
+
+organism = "org.Hs.eg.db"
+suppressMessages(library(organism, character.only = TRUE))
+```
+
+We are interested in biological annotation of cluster 0. We want to find biological process (BP) Gene Ontology terms that are enriched in cluster 0. First, we aim to filter the marker genes by selecting only those that are statistically significant after p-value adjustment and ensuring that they are truly representative of the cluster. If the gene set is too large, it may become too general, reducing the specificity of the analysis and potentially diluting meaningful biological insights.
+
+```{r filt-c0}
+cluster0.markers <- cluster0.markers[cluster0.markers$p_val_adj < 0.05,]
+cluster0.markers <- cluster0.markers[cluster0.markers$pct.1 > 0.2,]
+```
+
+We aim to use the most upregulated genes of cluster 0 in ORA by selecting those that are expressed at least twice as much in cluster 0 cells compared to other cells. Here, we visualize the distribution of `avg_log2FC` values using a histogram to illustrate our selected threshold.
+
+
+```{r filt-2-c0}
+filt.markers <- cluster0.markers[cluster0.markers$avg_log2FC > 0.50,]
+genes <- rownames(filt.markers)
+length(genes)
+```
+
+## Creating enrichGO object
+
+Gene ids are as "SYMBOL" and we use biological process (BP) as ontology. You can also try analysis with other ontologies: MF (Molecular Function) or CC (Cellular Component).
+
+We have to define background genes first which we use as 'gene universe'. 
+
+```{r enrich-c0}
+gene.universe <- rownames(aml@assays$RNA)
+c0.res <- enrichGO(gene = genes,
+                      universe = gene.universe,
+                      OrgDb = organism, 
+                      keyType = 'SYMBOL',
+                      readable = F,
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.01)
+
+head(c0.res)
+```
+
+Let's visualize the results in a barplot.
+
+```{r enrich-barplot-c0}
+barplot(c0.res, 
+        drop = TRUE, 
+        showCategory = 10, 
+        title = "Top GO terms (biological processes) in cluster 0",
+        font.size = 8)
+
+```
+
+### Exercise 12
+
+Perform Gene Ontology GO over-representation analysis using molecular function (`ont = "MF"`).
+
+
+Finally, we save the `aml` object and clear the objects from the memory.
+
+```{r}
+## Save the object
+saveRDS(aml, file = file.path("results/sc-rnaseq/robj/aml.session3.RDS"))
+
+## clear env
+rm(list = ls())
+gc()
+```
+
+
+
+<!-- ░██████╗███████╗░██████╗░██████╗██╗░█████╗░███╗░░██╗░░░░██╗██╗
+     ██╔════╝██╔════╝██╔════╝██╔════╝██║██╔══██╗████╗░██║░░░██╔╝██║
+     ╚█████╗░█████╗░░╚█████╗░╚█████╗░██║██║░░██║██╔██╗██║░░██╔╝░██║
+     ░╚═══██╗██╔══╝░░░╚═══██╗░╚═══██╗██║██║░░██║██║╚████║░░███████║
+     ██████╔╝███████╗██████╔╝██████╔╝██║╚█████╔╝██║░╚███║░░╚════██║
+     ╚═════╝░╚══════╝╚═════╝░╚═════╝░╚═╝░╚════╝░╚═╝░░╚══╝░░░░░░░╚═╝ -->
+     
+# Cell type annotation
+
+## Manual annotation of cell types
+
+Once the dataset is correctly preprocessed and batch effects are eliminated from the data, after performing dimensionality reduction, the cells from the same cell type tend to cluster together. We can use this property to manually check and annotate the clusters we have previously identified.
+
+
+```{r manual-cell-type-annotation}
+suppressMessages(library(Seurat))
+suppressMessages(library(gridExtra))
+suppressMessages(library(ggplot2))
+suppressMessages(library(glmGamPoi))
+suppressMessages(library(scCATCH))
+suppressMessages(library(dplyr))
+
+## load aml object
+aml <- readRDS("/home/rstudio/abptds/results/sc-rnaseq/robj/aml.session3.RDS")
+
+## UMAP
+DimPlot(aml, reduction = "umap", group.by = "sample")
+
+## Subset
+aml2.r <- subset(aml, subset = sample=="AML2_R")
+
+## Blast cells
+FeaturePlot(aml2.r,features = c( "ANKRD28", "GNA15"))
+
+## remove object
+rm(aml2.r)
+gc()
+
+```
+
+
+
+## Automatic cell-type annotation using markers (ScType)
+
+There are some other problems with manual annotation:
+
+- Time consuming
+- Lower reproducibility
+- Need of prior knowledge on the expected cell types
+- Depend on a good cluster definition
+- Identification of lower level or rare subtypes sometimes it's not possible
+
+So let's take a look at other methods for cell annotation.
+There are many annotation tools with different approaches and their performance might vary depending on the dataset (see review). Here, we will use [scCATCH](https://github.com/ZJUFanLab/scCATCH) for its simplicity.
+
+
+```{r scCatch}
+# extract normalized count and cluster info from Seurat object
+mat <- aml@assays$RNA$data
+clust    <- as.character( aml@meta.data$seurat_clusters )
+
+
+## create scCATCH obj
+sc.catch.obj <- createscCATCH(data = mat, cluster = clust)
+
+## find markers
+sc.catch.obj <- findmarkergene(sc.catch.obj, species="Human", marker=cellmatch, tissue=c("Bone marrow"))
+
+## find cell type for each cluster
+sc.catch.obj <- findcelltype(sc.catch.obj)
+
+## list cell types
+celltype.pred <- sc.catch.obj@celltype
+
+## remove obj
+rm(sc.catch.obj)
+gc()
+```
+
+Now, lets apply the detected cell types information in Seurat object `aml`.
+
+```{r apply-cell-types}
+
+DimPlot(aml, reduction = "umap", group.by = "seurat_clusters", label = TRUE)
+
+new.cell.ids <-  aml@meta.data$seurat_clusters 
+
+
+new.cell.ids <- gsub("^2$", "Stromal Cell", new.cell.ids)
+new.cell.ids <- gsub(4, "Monocyte, Stem Cell", new.cell.ids)
+new.cell.ids <- gsub(5, "Mesenchymal Stem Cell", new.cell.ids)
+new.cell.ids <- gsub(7, "Macrophage", new.cell.ids)
+new.cell.ids <- gsub(8, "Mesenchymal Stromal Cell", new.cell.ids)
+
+aml <-AddMetaData(aml, new.cell.ids, col.name="cell_type")
+DimPlot(aml, reduction = "umap", label = TRUE, pt.size = 0.5, group.by = "cell_type", repel = TRUE) + NoLegend()
+
+
+## clear env totally
+rm(list = ls())
+gc()
+
+```
+
+
+<!--░██╗░░░░░░░██╗░█████╗░██████╗░██╗░░██╗███████╗██╗░░░░░░█████╗░░██╗░░░░░░░██╗
+    ░██║░░██╗░░██║██╔══██╗██╔══██╗██║░██╔╝██╔════╝██║░░░░░██╔══██╗░██║░░██╗░░██║
+    ░╚██╗████╗██╔╝██║░░██║██████╔╝█████═╝░█████╗░░██║░░░░░██║░░██║░╚██╗████╗██╔╝
+    ░░████╔═████║░██║░░██║██╔══██╗██╔═██╗░██╔══╝░░██║░░░░░██║░░██║░░████╔═████║░
+    ░░╚██╔╝░╚██╔╝░╚█████╔╝██║░░██║██║░╚██╗██║░░░░░███████╗╚█████╔╝░░╚██╔╝░╚██╔╝░
+    ░░░╚═╝░░░╚═╝░░░╚════╝░╚═╝░░╚═╝╚═╝░░╚═╝╚═╝░░░░░╚══════╝░╚════╝░░░░╚═╝░░░╚═╝░░ -->
+
+# A complete workflow
+
+Here is a summary of a complete analysis workflow.
+
+## Loading the data
+
+Firstly, we have to load the data. In the following code block we are using the aggregate data.
+
+```{r wrkflow-data-loading, warning=FALSE}
+
+## read 10X data
+aml <- Read10X(data.dir = file.path("/home/rstudio/abptds/data/sc-rnaseq/aggregate"))
+
+## create a seurat object
+aml.all <- CreateSeuratObject(counts=aml, names.delim = "-", names.field = 2)
+
+## set new identities
+aml.all <- RenameIdents(aml.all, '1' = "AML2_R", "2" = "AML1_D", "3"="AML3_D", "4"="AML3_R")
+table( Idents(aml.all) )
+
+## add 'sample' column to aml.all@meta.data dataframe
+aml.all <- AddMetaData(aml.all, Idents(aml.all), col.name = "sample")
+
+## Calculate MT genes
+aml.all[["percent.mt"]] <- PercentageFeatureSet(aml.all, pattern = "^MT-")
+
+## Calculate globin genes
+aml.all[["percent.globin"]] <- PercentageFeatureSet(aml.all, pattern = "HBA1| HBA-Z | HBE | HBG1 | HBG12 | HBD | HBB | MB")
+```
+
+
+## QC-plots
+
+The second step is to check QC. Please note that , in the above code block we have calculated `percent.globin`.
+
+```{r wrkflow-qc, warning=FALSE}
+## violin plot showing nFeature_RNA, nCount_RNA and percent.mt
+VlnPlot(aml.all, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+
+## globin %
+VlnPlot(aml.all, features = c("percent.globin"))
+
+## scatter plot nCount_RNA vs. percent.mt
+FeatureScatter(aml.all, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+           theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+
+## scatter plot nCount_RNA vs. nFeature_RNA
+FeatureScatter(aml.all, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+   theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+## Filtering
+
+Based on above QC plots, we are filtering cells based on `nFeature_RNA`, `nFeature_RNA`, `percent.mt`, and `percent.globin`.
+
+```{r wrkflow-filt, warning=FALSE}
+## Filter
+temp1 <- subset(aml.all, subset = nFeature_RNA > 500 & nFeature_RNA < 3500 & percent.mt < 10 & percent.globin < 2 & sample=="AML1_D")
+temp2 <- subset(aml.all, subset = nFeature_RNA > 500 & nFeature_RNA < 3000 & percent.mt < 10 & percent.globin < 2 & sample=="AML2_R")
+temp3 <- subset(aml.all, subset = nFeature_RNA > 500 & nFeature_RNA < 2500 & percent.mt < 10 & percent.globin < 2 & sample=="AML3_D")
+temp4 <- subset(aml.all, subset = nFeature_RNA > 600 & nFeature_RNA < 3000 & percent.mt < 10 & percent.globin < 2 & sample=="AML3_R")
+
+## create a new aggregated data object
+aml.filt <- merge(temp1,  list(temp2, temp3, temp4))
+aml.filt <- JoinLayers(aml.filt)
+
+## violin plot showing nFeature_RNA, nCount_RNA and percent.mt
+VlnPlot(aml.filt, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+
+## scatter plot nCount_RNA vs. percent.mt
+FeatureScatter(aml.filt, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+           theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+
+## scatter plot nCount_RNA vs. nFeature_RNA
+FeatureScatter(aml.filt, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+   theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+## remov eobjects
+rm(temp1, temp2, temp3, temp4)
+gc()
+```
+
+## Normalization and Variable features detection
+
+After filtering, we are normalizing the data and calculating highly variable genes.
+
+```{r wrkflow-norm, warning=FALSE}
+## normalization
+aml.filt <- NormalizeData(aml.filt)
+
+## calculate variable features
+aml.filt <- FindVariableFeatures(aml.filt, nfeatures=2000, verbose = FALSE)
+
+## Get top 10 most highly variable genes
+top10 <- head(VariableFeatures(aml.filt), 10)
+top10
+
+## Plot HVGs with labels
+hvg <- VariableFeaturePlot(aml.filt) + labs(title = 'HVGs')
+LabelPoints(plot = hvg, points = top10, repel = TRUE) + labs(title = 'HVGs, top10 HVGs labeled')
+```
+## Scaling the data, the removal of undesired sources of variation
+
+Next step is to scale the data. In the following block we are regressing out the variables `percent.mt`, `percent.globin`, `S.Score`, `G2M.Score` on the same go.
+
+```{r wrkflow-scale, warning=FALSE}
+## cell cycle scoring
+aml.filt <- CellCycleScoring(aml.filt,
+                        s.features = cc.genes$s.genes,
+                        g2m.features = cc.genes$g2m.genes,
+                        set.ident = TRUE)
+
+## scaling and regressing-out undesired variance
+aml.filt <- ScaleData(aml.filt,
+                 vars.to.regress = c("percent.mt", "percent.globin", "S.Score", "G2M.Score"),
+                 layer = "data",
+                 verbose = FALSE)
+
+```
+## Dimensionality reduction
+
+After adjusting all the possible biases, we perform the dimensional reduction and clustering.
+
+```{r wrkflow-dim}
+## Run PCA
+aml.filt <- RunPCA(aml.filt,
+              features = VariableFeatures(aml.filt),
+              ndims.print = 1:3,
+              nfeatures.print = 20)
+
+
+## Visualize PCA results
+DimPlot(aml.filt,
+        reduction = "pca",
+        group.by = "sample")
+
+## PCA heatmap
+DimHeatmap(aml.filt, dims = 1:6, cells = 500, balanced = TRUE, fast = FALSE)
+DimHeatmap(aml.filt, dims = 7:12, cells = 500, balanced = TRUE, fast = FALSE)
+
+# Elbow plot
+ElbowPlot(aml.filt, ndims = 50)
+
+## Run UMAP
+aml.filt <- RunUMAP(aml.filt, dims = 1:30, verbose = FALSE)
+
+## Run clustering
+## Find-k-nearest neighbor
+aml.filt <- FindNeighbors(aml.filt, dims = 1:30, reduction = "pca")
+
+## Find clusters
+aml.filt <- FindClusters(aml.filt)
+
+## UMAP 
+DimPlot(aml.filt, reduction = "umap", label= TRUE)
+DimPlot(aml.filt, reduction = "umap", label= TRUE, group.by = "sample")
+```
+
+## Differential gene expression
+
+From the above code block we have got clusters. Now, we want to find markers of those clusters.
+
+```{r wrkflow-dge, warning=FALSE}
+## get all markers
+all.markers  <- FindAllMarkers(aml.filt, min.pct = 0.1, logfc.threshold = 0.25)
+
+## filter markers
+markers.filt <- all.markers[all.markers$p_val_adj < 0.05,]
+
+## top 10 per cluster
+markers.filt %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> top10
+
+DoHeatmap(aml.filt, features = top10$gene, size = 3) + theme(text = element_text(size = 3)) + NoLegend() 
+
+```
+
+## Cell type annotation
+
+In the following code block we are using scCATCH to detect cell types automatically.
+
+```{r wrkflow-cell-type}
+## create scCATCH obj
+sc.catch <- createscCATCH(data = aml.filt@assays$RNA$data, cluster = as.character( aml.filt@meta.data$seurat_clusters ) )
+
+## find markers
+sc.catch <- findmarkergene(sc.catch, species="Human", marker=cellmatch, tissue=c("Bone marrow"))
+
+## find cell type for each cluster
+sc.catch <- findcelltype(sc.catch)
+
+## list cell types
+cell.type.pred <- sc.catch@celltype
+
+## show the predicted cell types
+cell.type.pred
+
+## remove obj
+rm(sc.catch)
+gc()
+```
+
